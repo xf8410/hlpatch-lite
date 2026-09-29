@@ -19,6 +19,8 @@
 //! ObscuredInt getters: get_SkillPoint() returns ObscuredInt (boxed) - needs special handling
 
 #![allow(dead_code)]
+mod training_anim_skip;
+mod signup_plaintext;
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use rusqlite::{Connection, OpenFlags};
@@ -580,6 +582,85 @@ extern "C" {
     fn sys_siglongjmp(env: *const u8, val: i32) -> !;
 }
 
+// ===== v3.28.2 crash-log-path fix =====
+// Resolves a user-reachable crash-log directory (Android/media/<pkg>/hachimi,
+// the same place ura_boot.log already writes successfully) instead of the
+// dead /data/data/jp.pokemon.pokeuma path, which belongs to a package that is
+// not running on device and silently swallowed every crash record.
+// The signal handler reads a pre-warmed static buffer, so it never allocates.
+static mut CRASH_LOG_FILE_BUF: [u8; 320] = [0u8; 320];
+static CRASH_LOG_FILE_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn hl_pkg_name() -> String {
+    let raw = std::fs::read("/proc/self/cmdline").unwrap_or_default();
+    String::from_utf8_lossy(&raw)
+        .trim_matches(char::from(0))
+        .trim()
+        .to_string()
+}
+
+/// Log directory, resolved once. Falls back to the historical private path
+/// when the package name cannot be trusted, so this can never be worse than
+/// the behaviour it replaces.
+fn hl_crash_log_dir() -> &'static str {
+    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let pkg = hl_pkg_name();
+        let plausible = pkg.len() >= 4
+            && pkg.len() < 128
+            && pkg.contains('.')
+            && !pkg.contains('/')
+            && !pkg.contains(' ');
+        if plausible {
+            let dir = format!("/sdcard/Android/media/{}/hachimi", pkg);
+            if std::fs::create_dir_all(&dir).is_ok() {
+                return dir;
+            }
+        }
+        "/data/data/jp.pokemon.pokeuma/files".to_string()
+    })
+    .as_str()
+}
+
+fn hl_crash_log_file() -> String {
+    format!("{}/uma_predict.log", hl_crash_log_dir())
+}
+
+/// Pre-warm the NUL-terminated path used from the signal handler. Called from
+/// init_crash_handler, i.e. before any signal can arrive.
+fn hl_crash_log_init() {
+    let path = hl_crash_log_file();
+    let bytes = path.as_bytes();
+    unsafe {
+        let buf = std::ptr::addr_of_mut!(CRASH_LOG_FILE_BUF) as *mut u8;
+        let n = bytes.len().min(319);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
+        *buf.add(n) = 0;
+    }
+    CRASH_LOG_FILE_READY.store(true, std::sync::atomic::Ordering::Release);
+    boot_trace(&format!("crash_log={}", path));
+}
+
+/// NUL-terminated path slice for raw syscalls. Allocates nothing.
+fn hl_crash_log_file_cstr() -> &'static [u8] {
+    const FALLBACK: &[u8] = b"/data/local/tmp/uma_predict.log\0";
+    if !CRASH_LOG_FILE_READY.load(std::sync::atomic::Ordering::Acquire) {
+        return FALLBACK;
+    }
+    unsafe {
+        let base = std::ptr::addr_of!(CRASH_LOG_FILE_BUF) as *const u8;
+        let mut end = 0usize;
+        while end < 319 && *base.add(end) != 0 {
+            end += 1;
+        }
+        if end == 0 {
+            return FALLBACK;
+        }
+        std::slice::from_raw_parts(base, end + 1)
+    }
+}
+
 const CRASH_LOG_PATH: &str = "/data/data/jp.pokemon.pokeuma/files/uma_predict.log";
 
 // ★ v3.22.35: SIGSEGV recovery for push thread
@@ -643,7 +724,7 @@ extern "C" fn crash_signal_handler(sig: i32) {
     len += r.len();
     msg[len] = b'\n';
     len += 1;
-    let path = b"/data/data/jp.pokemon.pokeuma/files/uma_predict.log\0";
+    let path = hl_crash_log_file_cstr();
     let fd = unsafe { sys_open(path.as_ptr() as *const i8, 1 | 64 | 1024, 0o644) };
     if fd >= 0 {
         unsafe {
@@ -672,6 +753,7 @@ extern "C" fn crash_signal_handler(sig: i32) {
 }
 
 fn init_crash_handler() {
+    hl_crash_log_init();
     unsafe {
         let handler = crash_signal_handler as usize;
         sys_signal(11, handler); // SIGSEGV
@@ -684,7 +766,7 @@ fn init_crash_handler() {
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("/data/data/jp.pokemon.pokeuma/files/uma_predict.log")
+            .open(hl_crash_log_file())
             .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
     }));
 }
@@ -703,7 +785,7 @@ fn log_predict_step(msg: &str) {
     LAST_STEP_LEN.store(len as u32, std::sync::atomic::Ordering::Relaxed);
 
     // Write to file using raw libc syscalls (more reliable than std::fs on Android)
-    let path1 = b"/data/data/jp.pokemon.pokeuma/files/uma_predict.log\0";
+    let path1 = hl_crash_log_file_cstr();
     let path2 = b"/data/local/tmp/uma_predict.log\0";
     let line_bytes = line.as_bytes();
     unsafe {
@@ -721,7 +803,7 @@ fn log_predict_step(msg: &str) {
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("/data/data/jp.pokemon.pokeuma/files/uma_predict.log")
+            .open(hl_crash_log_file())
             .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
     }
 }
@@ -729,7 +811,7 @@ fn log_predict_step(msg: &str) {
 fn clear_predict_log() {
     PREDICT_STEP.store(0, std::sync::atomic::Ordering::Relaxed);
     LAST_STEP_LEN.store(0, std::sync::atomic::Ordering::Relaxed);
-    let path1 = b"/data/data/jp.pokemon.pokeuma/files/uma_predict.log\0";
+    let path1 = hl_crash_log_file_cstr();
     let path2 = b"/data/local/tmp/uma_predict.log\0";
     unsafe {
         let fd = sys_open(path1.as_ptr() as *const i8, 1 | 64 | 512, 0o644);
@@ -749,13 +831,22 @@ fn read_crash_log() -> String {
     if sig != 0 {
         return format!(r#"{{"crash":true,"signal":{},"step":{}}}"#, sig, step);
     }
-    match std::fs::read_to_string("/data/data/jp.pokemon.pokeuma/files/uma_predict.log") {
-        Ok(s) if !s.is_empty() => s,
-        _ => match std::fs::read_to_string("/data/local/tmp/uma_predict.log") {
-            Ok(s) if !s.is_empty() => s,
-            _ => r#"{"error":"no_crash_log"}"#.to_string(),
-        },
+    let mut parts: Vec<String> = Vec::new();
+    for p in [
+        hl_crash_log_file(),
+        "/data/data/jp.pokemon.pokeuma/files/uma_predict.log".to_string(),
+        "/data/local/tmp/uma_predict.log".to_string(),
+    ] {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if !s.is_empty() {
+                parts.push(s);
+            }
+        }
     }
+    if parts.is_empty() {
+        return r#"{"error":"no_crash_log"}"#.to_string();
+    }
+    parts.join("\n--- next sink ---\n")
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -804,7 +895,7 @@ fn boot_trace(step: &str) {
             v.pop();
             v.pop().map(|s| s.to_string())
         })
-        .unwrap_or_else(|| "/data/data/jp.pokemon.pokeuma/files".to_string());
+        .unwrap_or_else(|| hl_crash_log_dir().to_string());
     let log_path = format!("{}/ura_boot.log", so_dir);
     if step == "BEGIN" {
         let _ = std::fs::write(&log_path, "ura boot trace\n");
@@ -6555,40 +6646,7 @@ unsafe fn read_summary_inner_impl() -> String {
     // ★ AI Evaluation (v3.15.1): compute score and training recommendation
     // FIXED: no more double-read of CommandInfoArray — eval_trainings collected in phase2
     log_predict_step("S:buffs done");
-    let ai_json = {
-        // v3.27.10: Ramen AI enabled — turn mapping follows upstream umaai-rs semantics.
-        let turn = if sid == 14 {
-            cumulative_turn
-        } else {
-            std::cmp::min((mon - 1) * 2 + (half - 1), 71)
-        };
-        let stats = [spd, sta, pow_, gut, wiz];
-
-        // Detect buffs from chara_effect_ids
-        let has_ai_jiao = chara_effect_ids.iter().any(|&id| id == 8);
-        let has_renshou_jouzu = chara_effect_ids.iter().any(|&id| id == 10 || id == 11);
-
-        // next_race lookup not yet implemented for Ramen.
-        let next_race = false;
-
-        let result = evaluate_ai(
-            turn,
-            stats,
-            vit,
-            mvit,
-            mot,
-            sid,
-            &eval_trainings,
-            has_ai_jiao,
-            has_renshou_jouzu,
-            skill_eval,
-            skill_count, // ★ v3.22.0
-            &ramen_gauge_gains_map,
-            ramen_special_feeling_num,
-            next_race,
-        );
-        ai_result_to_json(&result)
-    };
+    let ai_json = String::from("null"); // v3.28.3 ai removed: SO is a pure data pipeline, jueceramen owns all decisions
 
     // ★ Breeders team member data (v3.15.4)
     let team_json = if sid == 13 {
@@ -7569,6 +7627,10 @@ fn handle_http(mut stream: std::net::TcpStream) {
     // that touches game memory; static/self-state endpoints stay available.
     if !GAME_INITIALIZED.load(Ordering::Relaxed) {
         const BOOT_SAFE_EXACT: &[&str] = &[
+    "/api/sniff/signup_plaintext",
+    "/api/training/anim_skip/off",
+    "/api/training/anim_skip/on",
+    "/api/training/anim_skip",
     "/il2cpp/exact_method",
     "/runtime/init_status",
     "/hooks/registry",
@@ -7704,7 +7766,7 @@ fn handle_http(mut stream: std::net::TcpStream) {
         safe_maps_summary()
     } else if path == "/" || path == "/health" {
         format!(
-            r#"{{"status":"ok","version":"{}","endpoints":[\"/inherit/tree\",\"/inherit/parent_records\",\"/inherit/race_history\",\"/inherit/race_compat\",\"/inherit/full_compat\",\"/inherit/compat_trace\",\"/inherit/factor_tree\",\"/inherit/bonus_params\",\"/inherit/event_trace\",\"/inherit/deck_runtime\",\"/inherit/deck_validate\",\"/inherit/friend_rental_context\",\"/inherit/auto_select_trace\",\"/autoplay/runtime\",\"/autoplay/plan\",\"/autoplay/action_trace\",\"/autoplay/factor_select_trace\",\"/offline_auto/runtime\",\"/offline_auto/start_request\",\"/offline_auto/race_reserve\",\"/offline_auto/result\",\"/generate_succession/status\",\"/generate_succession/limits\",\"/generate_succession/request\",\"/generate_succession/result\",\"/generate_succession/candidates\",\"/generate_succession/race_reserve\",\"/generate_succession/race_validation\",\"/generate_succession/factor_priority\",\"/generate_succession/factor_order\",\"/generate_succession/probability_trace\",\"/generate_succession/cost_trace\",\"/factor/finish_trace\",\"/factor/candidates\",\"/factor/roll_trace\",\"/factor/probability_model\",\"/factor/history\",\"/factor/stats\",\"/factor/breeding_advice\",\"/il2cpp/call_targets\",\"/il2cpp/callers\",\"/il2cpp/type_detail\",\"/il2cpp/object_dump\",\"/api/sniff/exchanges\",\"/api/sniff/exchange\",\"/api/hook/install\",\"/api/hook/remove\",\"/api/hook/list\",\"/api/hook/events\",\"/storage/files\",\"/storage/download\","/storage/status","/storage/sessions","/storage/session","/storage/flush","/storage/recover","/il2cpp/method_index_status","/il2cpp/method_by_addr","/il2cpp/method_detail","/il2cpp/nested_types","/il2cpp/enum_values","/inherit/pair_compat","/inherit/selected_parent_runtime","/summary","/data","/scenario","/debug/rameninfo","/debug/laststep","/event/recommend","/inherit/compat","/saddle-analysis","/log/turn","/debug/params","/debug/breeders","/debug/cmdinfo","/debug/training_partners","/debug/crashlog","/debug/upload","/debug/dumpclass","/debug/storydata","/debug/ramenfields","/debug/gauge","/debug/gauge2","/debug/ramengains","/debug/paramsincdec","/debug/training_seed","/debug/training_log","/debug/training_log_dl","/update","/update/status","/debug/all","/debug/unique_skills","/debug/mdb_all_tables","/debug/mdb_schema_dump","/debug/hint_gain","/debug/sc_effect","/debug/unique_detail","/debug/table","/debug/push_table","/debug/download_table","/mdb","/carddb","/skilldata","/hall","/saddles","/saddles-dl","/log","/status","/health","/mdb/schema","/mdb/search","/mdb/raw","/mdb/dl_batch","/il2cpp/dump","/il2cpp/call","/il2cpp/tree","/il2cpp/field","/il2cpp/classes","/il2cpp/static","/il2cpp/methods","/il2cpp/disassemble","/il2cpp/disassemble_dl","/il2cpp/disassemble_addr","/il2cpp/disassemble_addr_dl","/il2cpp/dump_all_methods","/il2cpp/dump_all_methods_dl","/il2cpp/search_float","/il2cpp/search_float_dl","/il2cpp/search_int","/il2cpp/search_int_dl","/il2cpp/search_methods","/il2cpp/search_methods_dl","/il2cpp/read_mem","/il2cpp/read_mem_dl","/training/result","/api/sniff","/api/sniff/metadata","/api/sniff/status","/api/sniff/toggle","/api/sniff/clear","/api/sniff/diag","/api/event/choices","/api/event/clear","/debug/hooklog","/debug/hookdiag","/debug/resource_meta_key","/debug/resource_db_keys","/debug/resource_reads","/debug/mem_scan_sqlite","/debug/meta_dump","/action/latest","/seed/history","/seed/stats","/debug/ramen_planner_state","/debug/ramen_participants","/debug/ramen_transition","/debug/ramen_dataset_path","/debug/ramen_formula_targets","/debug/event_reward_targets", "/debug/resource_storage","/debug/resource_meta_schema","/debug/resource_meta_probe", "/debug/resource_crypto_symbols","/debug/resource_meta_dl","/debug/resource_file_dl","/debug/private_file_inventory","/debug/private_file_dl"]}}"#,
+            r#"{{"status":"ok","version":"{}","endpoints":[\"/inherit/tree\",\"/inherit/parent_records\",\"/inherit/race_history\",\"/inherit/race_compat\",\"/inherit/full_compat\",\"/inherit/compat_trace\",\"/inherit/factor_tree\",\"/inherit/bonus_params\",\"/inherit/event_trace\",\"/inherit/deck_runtime\",\"/inherit/deck_validate\",\"/inherit/friend_rental_context\",\"/inherit/auto_select_trace\",\"/autoplay/runtime\",\"/autoplay/plan\",\"/autoplay/action_trace\",\"/autoplay/factor_select_trace\",\"/offline_auto/runtime\",\"/offline_auto/start_request\",\"/offline_auto/race_reserve\",\"/offline_auto/result\",\"/generate_succession/status\",\"/generate_succession/limits\",\"/generate_succession/request\",\"/generate_succession/result\",\"/generate_succession/candidates\",\"/generate_succession/race_reserve\",\"/generate_succession/race_validation\",\"/generate_succession/factor_priority\",\"/generate_succession/factor_order\",\"/generate_succession/probability_trace\",\"/generate_succession/cost_trace\",\"/factor/finish_trace\",\"/factor/candidates\",\"/factor/roll_trace\",\"/factor/probability_model\",\"/factor/history\",\"/factor/stats\",\"/factor/breeding_advice\",\"/il2cpp/call_targets\",\"/il2cpp/callers\",\"/il2cpp/type_detail\",\"/il2cpp/object_dump\",\"/api/sniff/exchanges\",\"/api/sniff/exchange\",\"/api/hook/install\",\"/api/hook/remove\",\"/api/hook/list\",\"/api/hook/events\",\"/storage/files\",\"/storage/download\","/storage/status","/storage/sessions","/storage/session","/storage/flush","/storage/recover","/il2cpp/method_index_status","/il2cpp/method_by_addr","/il2cpp/method_detail","/il2cpp/nested_types","/il2cpp/enum_values","/inherit/pair_compat","/inherit/selected_parent_runtime","/summary","/data","/scenario","/debug/rameninfo","/debug/laststep","/event/__recommend_disabled_v3283__","/inherit/compat","/saddle-analysis","/log/turn","/debug/params","/debug/breeders","/debug/cmdinfo","/debug/training_partners","/debug/crashlog","/debug/upload","/debug/dumpclass","/debug/storydata","/debug/ramenfields","/debug/gauge","/debug/gauge2","/debug/ramengains","/debug/paramsincdec","/debug/training_seed","/debug/training_log","/debug/training_log_dl","/update","/update/status","/debug/all","/debug/unique_skills","/debug/mdb_all_tables","/debug/mdb_schema_dump","/debug/hint_gain","/debug/sc_effect","/debug/unique_detail","/debug/table","/debug/push_table","/debug/download_table","/mdb","/carddb","/skilldata","/hall","/saddles","/saddles-dl","/log","/status","/health","/mdb/schema","/mdb/search","/mdb/raw","/mdb/dl_batch","/il2cpp/dump","/il2cpp/call","/il2cpp/tree","/il2cpp/field","/il2cpp/classes","/il2cpp/static","/il2cpp/methods","/il2cpp/disassemble","/il2cpp/disassemble_dl","/il2cpp/disassemble_addr","/il2cpp/disassemble_addr_dl","/il2cpp/dump_all_methods","/il2cpp/dump_all_methods_dl","/il2cpp/search_float","/il2cpp/search_float_dl","/il2cpp/search_int","/il2cpp/search_int_dl","/il2cpp/search_methods","/il2cpp/search_methods_dl","/il2cpp/read_mem","/il2cpp/read_mem_dl","/training/result","/api/sniff","/api/sniff/metadata","/api/sniff/status","/api/sniff/toggle","/api/sniff/clear","/api/sniff/diag","/api/event/choices","/api/event/clear","/debug/hooklog","/debug/hookdiag","/debug/resource_meta_key","/debug/resource_db_keys","/debug/resource_reads","/debug/mem_scan_sqlite","/debug/meta_dump","/action/latest","/seed/history","/seed/stats","/debug/ramen_planner_state","/debug/ramen_participants","/debug/ramen_transition","/debug/ramen_dataset_path","/debug/ramen_formula_targets","/debug/event_reward_targets", "/debug/resource_storage","/debug/resource_meta_schema","/debug/resource_meta_probe", "/debug/resource_crypto_symbols","/debug/resource_meta_dl","/debug/resource_file_dl","/debug/private_file_inventory","/debug/private_file_dl"]}}"#,
             PLUGIN_VERSION
         )
     } else if path == "/scan" {
@@ -8889,7 +8951,7 @@ fn handle_http(mut stream: std::net::TcpStream) {
         read_skilldata()
     } else if path == "/hall" {
         unsafe { read_hall_data() }
-    } else if path == "/event/recommend" {
+    } else if path == "/event/__recommend_disabled_v3283__" {
         unsafe { read_event_recommend() }
     } else if path == "/inherit/selected_parent_records" {
         unsafe { inherit_selected_parent_records_endpoint() }
@@ -9088,6 +9150,14 @@ fn handle_http(mut stream: std::net::TcpStream) {
         foundation_capture_status_endpoint()
     } else if path == "/storage/turn_event_jsons" {
         storage_turn_event_jsons(&full_uri)
+    } else if path == "/api/training/anim_skip" {
+        training_anim_skip::endpoint()
+    } else if path == "/api/training/anim_skip/on" {
+        training_anim_skip::enable_endpoint()
+    } else if path == "/api/training/anim_skip/off" {
+        training_anim_skip::disable_endpoint()
+    } else if path == "/api/sniff/signup_plaintext" {
+        unsafe { signup_plaintext::endpoint() }
     } else if path == "/storage/files" {
         storage_files_endpoint(&full_uri)
     } else if path == "/storage/download" {
@@ -9508,7 +9578,7 @@ fn handle_http(mut stream: std::net::TcpStream) {
         }
     } else {
         format!(
-            r#"{{"error":"not_found","path":"{}","available":[\"/inherit/tree\",\"/inherit/parent_records\",\"/inherit/race_history\",\"/inherit/race_compat\",\"/inherit/full_compat\",\"/inherit/compat_trace\",\"/inherit/factor_tree\",\"/inherit/bonus_params\",\"/inherit/event_trace\",\"/inherit/deck_runtime\",\"/inherit/deck_validate\",\"/inherit/friend_rental_context\",\"/inherit/auto_select_trace\",\"/autoplay/runtime\",\"/autoplay/plan\",\"/autoplay/action_trace\",\"/autoplay/factor_select_trace\",\"/offline_auto/runtime\",\"/offline_auto/start_request\",\"/offline_auto/race_reserve\",\"/offline_auto/result\",\"/generate_succession/status\",\"/generate_succession/limits\",\"/generate_succession/request\",\"/generate_succession/result\",\"/generate_succession/candidates\",\"/generate_succession/race_reserve\",\"/generate_succession/race_validation\",\"/generate_succession/factor_priority\",\"/generate_succession/factor_order\",\"/generate_succession/probability_trace\",\"/generate_succession/cost_trace\",\"/factor/finish_trace\",\"/factor/candidates\",\"/factor/roll_trace\",\"/factor/probability_model\",\"/factor/history\",\"/factor/stats\",\"/factor/breeding_advice\",\"/il2cpp/call_targets\",\"/il2cpp/callers\",\"/il2cpp/type_detail\",\"/il2cpp/object_dump\",\"/api/sniff/exchanges\",\"/api/sniff/exchange\",\"/api/hook/install\",\"/api/hook/remove\",\"/api/hook/list\",\"/api/hook/events\",\"/storage/files\",\"/storage/download\","/storage/status","/storage/sessions","/storage/session","/storage/flush","/storage/recover","/il2cpp/method_index_status","/il2cpp/method_by_addr","/il2cpp/method_detail","/il2cpp/nested_types","/il2cpp/enum_values","/inherit/pair_compat","/inherit/selected_parent_runtime","/scan","/data","/status","/health","/scenario","/debug/upload","/debug/rameninfo","/debug/laststep","/event/recommend","/inherit/compat","/saddle-analysis","/log/turn","/log","/debug/params","/fields","/methods","/singletons","/find_method","/classes","/carddb","/skilldata","/hall","/debug/breeders","/debug/cmdinfo","/debug/training_partners","/debug/ramengains","/debug/paramsincdec","/debug/training_seed","/debug/training_log","/debug/training_log_dl","/update","/update/status","/debug/dumpclass","/debug/storydata","/debug/ramenfields","/debug/all","/mdb","/debug/push_table","/debug/download_table","/classes/search/keyword","/mdb/schema","/mdb/search","/mdb/raw","/mdb/dl_batch","/il2cpp/dump","/il2cpp/call","/il2cpp/tree","/il2cpp/field","/il2cpp/classes","/il2cpp/static","/il2cpp/methods","/il2cpp/search_float","/il2cpp/search_float_dl","/il2cpp/search_int","/il2cpp/search_int_dl","/il2cpp/search_methods","/il2cpp/search_methods_dl","/il2cpp/search_methods_page","/il2cpp/read_mem","/il2cpp/read_mem_dl","/training/result","/api/sniff","/api/sniff/metadata","/api/sniff/status","/api/sniff/toggle","/api/sniff/clear","/api/sniff/diag","/api/event/choices","/api/event/clear"]}}"#,
+            r#"{{"error":"not_found","path":"{}","available":[\"/inherit/tree\",\"/inherit/parent_records\",\"/inherit/race_history\",\"/inherit/race_compat\",\"/inherit/full_compat\",\"/inherit/compat_trace\",\"/inherit/factor_tree\",\"/inherit/bonus_params\",\"/inherit/event_trace\",\"/inherit/deck_runtime\",\"/inherit/deck_validate\",\"/inherit/friend_rental_context\",\"/inherit/auto_select_trace\",\"/autoplay/runtime\",\"/autoplay/plan\",\"/autoplay/action_trace\",\"/autoplay/factor_select_trace\",\"/offline_auto/runtime\",\"/offline_auto/start_request\",\"/offline_auto/race_reserve\",\"/offline_auto/result\",\"/generate_succession/status\",\"/generate_succession/limits\",\"/generate_succession/request\",\"/generate_succession/result\",\"/generate_succession/candidates\",\"/generate_succession/race_reserve\",\"/generate_succession/race_validation\",\"/generate_succession/factor_priority\",\"/generate_succession/factor_order\",\"/generate_succession/probability_trace\",\"/generate_succession/cost_trace\",\"/factor/finish_trace\",\"/factor/candidates\",\"/factor/roll_trace\",\"/factor/probability_model\",\"/factor/history\",\"/factor/stats\",\"/factor/breeding_advice\",\"/il2cpp/call_targets\",\"/il2cpp/callers\",\"/il2cpp/type_detail\",\"/il2cpp/object_dump\",\"/api/sniff/exchanges\",\"/api/sniff/exchange\",\"/api/hook/install\",\"/api/hook/remove\",\"/api/hook/list\",\"/api/hook/events\",\"/storage/files\",\"/storage/download\","/storage/status","/storage/sessions","/storage/session","/storage/flush","/storage/recover","/il2cpp/method_index_status","/il2cpp/method_by_addr","/il2cpp/method_detail","/il2cpp/nested_types","/il2cpp/enum_values","/inherit/pair_compat","/inherit/selected_parent_runtime","/scan","/data","/status","/health","/scenario","/debug/upload","/debug/rameninfo","/debug/laststep","/event/__recommend_disabled_v3283__","/inherit/compat","/saddle-analysis","/log/turn","/log","/debug/params","/fields","/methods","/singletons","/find_method","/classes","/carddb","/skilldata","/hall","/debug/breeders","/debug/cmdinfo","/debug/training_partners","/debug/ramengains","/debug/paramsincdec","/debug/training_seed","/debug/training_log","/debug/training_log_dl","/update","/update/status","/debug/dumpclass","/debug/storydata","/debug/ramenfields","/debug/all","/mdb","/debug/push_table","/debug/download_table","/classes/search/keyword","/mdb/schema","/mdb/search","/mdb/raw","/mdb/dl_batch","/il2cpp/dump","/il2cpp/call","/il2cpp/tree","/il2cpp/field","/il2cpp/classes","/il2cpp/static","/il2cpp/methods","/il2cpp/search_float","/il2cpp/search_float_dl","/il2cpp/search_int","/il2cpp/search_int_dl","/il2cpp/search_methods","/il2cpp/search_methods_dl","/il2cpp/search_methods_page","/il2cpp/read_mem","/il2cpp/read_mem_dl","/training/result","/api/sniff","/api/sniff/metadata","/api/sniff/status","/api/sniff/toggle","/api/sniff/clear","/api/sniff/diag","/api/event/choices","/api/event/clear"]}}"#,
             path
         )
     };
@@ -11308,6 +11378,7 @@ unsafe fn find_class_fuzzy(image: *const c_void, substr: &str) -> *mut c_void {
 }
 
 unsafe fn install_api_sniff_hooks() {
+    training_anim_skip::install();
     install_text_common_observer_hook();
     let all_hooked = COMPRESS_REQUEST_ADDR != 0
         && DECOMPRESS_RESPONSE_ADDR != 0
@@ -14416,7 +14487,8 @@ fn debug_unique_skills() -> String {
     drop(conn);
 
     format!(
-        r#"{{"ok":true,"version":"3.22.91","matched_tables":{},"table_details":[{}],"support_card_data_columns":[{}]}}"#,
+        r#"{{"ok":true,"version":"{}","matched_tables":{},"table_details":[{}],"support_card_data_columns":[{}]}}"#,
+            PLUGIN_VERSION,
         matched_tables.len(),
         results.join(","),
         sc_columns.join(",")
@@ -14529,7 +14601,8 @@ fn debug_table_query(table_name: &str, limit: usize, offset: usize) -> String {
         .map(|c| format!(r#""{}""#, json_escape(c)))
         .collect();
     format!(
-        r#"{{"ok":true,"version":"3.22.91","table":"{}","columns":[{}],"row_count":{},"limit":{},"offset":{},"rows":[{}]}}"#,
+        r#"{{"ok":true,"version":"{}","table":"{}","columns":[{}],"row_count":{},"limit":{},"offset":{},"rows":[{}]}}"#,
+            PLUGIN_VERSION,
         json_escape(table_name),
         col_json.join(","),
         total,
@@ -14680,7 +14753,8 @@ fn debug_push_table(table_name: &str, batch: usize, offset: usize) -> String {
             }
         }
         return format!(
-            r#"{{"ok":true,"version":"3.22.91","table":"{}","total_rows":{},"offset":{},"rows_queried":0,"complete":true,"download_url":"/debug/download_table?name={}"}}"#,
+            r#"{{"ok":true,"version":"{}","table":"{}","total_rows":{},"offset":{},"rows_queried":0,"complete":true,"download_url":"/debug/download_table?name={}"}}"#,
+                PLUGIN_VERSION,
             json_escape(table_name),
             total,
             offset,
@@ -14709,7 +14783,8 @@ fn debug_push_table(table_name: &str, batch: usize, offset: usize) -> String {
     if !is_last_batch {
         // Not done yet - return progress
         return format!(
-            r#"{{"ok":true,"version":"3.22.91","table":"{}","total_rows":{},"offset":{},"rows_queried":{},"next_offset":{},"complete":false}}"#,
+            r#"{{"ok":true,"version":"{}","table":"{}","total_rows":{},"offset":{},"rows_queried":{},"next_offset":{},"complete":false}}"#,
+                PLUGIN_VERSION,
             json_escape(table_name),
             total,
             offset,
@@ -14726,7 +14801,8 @@ fn debug_push_table(table_name: &str, batch: usize, offset: usize) -> String {
     }
 
     format!(
-        r#"{{"ok":true,"version":"3.22.91","table":"{}","total_rows":{},"offset":{},"rows_queried":{},"complete":true,"download_url":"/debug/download_table?name={}"}}"#,
+        r#"{{"ok":true,"version":"{}","table":"{}","total_rows":{},"offset":{},"rows_queried":{},"complete":true,"download_url":"/debug/download_table?name={}"}}"#,
+            PLUGIN_VERSION,
         json_escape(table_name),
         total,
         offset,
@@ -14925,7 +15001,8 @@ fn debug_download_table(table_name: &str, batch: usize) -> String {
     // If file > 2MB, return metadata instead of reading into memory
     if file_size > 2_000_000 {
         return format!(
-            r#"{{"ok":true,"version":"3.22.91","table":"{}","total_rows":{},"file_size":{},"file_path":"{}","hint":"file too large for HTTP response, use push_table batch mode instead"}}"#,
+            r#"{{"ok":true,"version":"{}","table":"{}","total_rows":{},"file_size":{},"file_path":"{}","hint":"file too large for HTTP response, use push_table batch mode instead"}}"#,
+                PLUGIN_VERSION,
             json_escape(table_name),
             total,
             file_size,
@@ -15102,7 +15179,8 @@ fn debug_unique_detail() -> String {
     drop(conn);
 
     format!(
-        r#"{{"ok":true,"version":"3.22.91","cards_with_unique":[{}],"all_effects":[{}],"combo_dist":[{}],"effect_filter":[{}],"t101_samples":[{}],"t116_samples":[{}]}}"#,
+        r#"{{"ok":true,"version":"{}","cards_with_unique":[{}],"all_effects":[{}],"combo_dist":[{}],"effect_filter":[{}],"t101_samples":[{}],"t116_samples":[{}]}}"#,
+            PLUGIN_VERSION,
         cards.join(","),
         effects.join(","),
         combo_dist.join(","),
@@ -15271,7 +15349,8 @@ fn debug_sc_effect() -> String {
         .collect();
 
     format!(
-        r#"{{"ok":true,"version":"3.22.91","effect_table":{{"columns":[{}],"sample":[{}],"unique_match":[{}]}},"effect_filter":{{"columns":[{}],"rows":[{}]}},"effect_filter_group":{{"columns":[{}],"rows":[{}]}},"unique_effect":{{"columns":[{}],"type_0_dist":[{}],"type_1_dist":[{}],"cond_rows":[{}]}}}}"#,
+        r#"{{"ok":true,"version":"{}","effect_table":{{"columns":[{}],"sample":[{}],"unique_match":[{}]}},"effect_filter":{{"columns":[{}],"rows":[{}]}},"effect_filter_group":{{"columns":[{}],"rows":[{}]}},"unique_effect":{{"columns":[{}],"type_0_dist":[{}],"type_1_dist":[{}],"cond_rows":[{}]}}}}"#,
+            PLUGIN_VERSION,
         scet_col_json.join(","),
         scet_rows.join(","),
         scet_unique.join(","),
@@ -15419,7 +15498,8 @@ fn debug_hint_gain() -> String {
     drop(conn);
 
     format!(
-        r#"{{"ok":true,"version":"3.22.91","hint_gain_sample":[{}],"hint_gain_with_cond":[{}],"hint_gain_type_dist":[{}],"condition_set_resolved":[{}],"unique_chara_sample":[{}]}}"#,
+        r#"{{"ok":true,"version":"{}","hint_gain_sample":[{}],"hint_gain_with_cond":[{}],"hint_gain_type_dist":[{}],"condition_set_resolved":[{}],"unique_chara_sample":[{}]}}"#,
+            PLUGIN_VERSION,
         hint_rows.join(","),
         hint_with_cond.join(","),
         type_dist.join(","),
@@ -15519,7 +15599,8 @@ fn debug_mdb_all_tables() -> String {
     drop(conn);
 
     format!(
-        r#"{{"ok":true,"version":"3.22.91","total_tables":{},"all_tables":[{}],"cond_keyword_tables":{},"cond_table_schemas":[{}]}}"#,
+        r#"{{"ok":true,"version":"{}","total_tables":{},"all_tables":[{}],"cond_keyword_tables":{},"cond_table_schemas":[{}]}}"#,
+            PLUGIN_VERSION,
         all_tables.len(),
         tables_json.join(","),
         cond_tables.len(),
@@ -16310,7 +16391,8 @@ fn read_events_data() -> String {
     drop(conn);
 
     format!(
-        r#"{{"ok":true,"version":"3.22.91","story_count":{},"choice_count":{},"gain_count":{},"title_count":{},"stories":[{}],"choices":[{}],"gains":[{}],"titles":[{}]}}"#,
+        r#"{{"ok":true,"version":"{}","story_count":{},"choice_count":{},"gain_count":{},"title_count":{},"stories":[{}],"choices":[{}],"gains":[{}],"titles":[{}]}}"#,
+            PLUGIN_VERSION,
         stories.len(),
         choices.len(),
         gains.len(),
@@ -16384,7 +16466,8 @@ fn read_carddb() -> String {
     drop(conn);
 
     format!(
-        r#"{{"ok":true,"version":"3.22.91","mdb":"{}","card_count":{},"effect_count":{},"cards":[{}],"effects":[{}]}}"#,
+        r#"{{"ok":true,"version":"{}","mdb":"{}","card_count":{},"effect_count":{},"cards":[{}],"effects":[{}]}}"#,
+            PLUGIN_VERSION,
         mdb_path,
         cards.len(),
         effects.len(),
@@ -16472,7 +16555,8 @@ fn read_skilldata() -> String {
     drop(conn);
 
     format!(
-        r#"{{"ok":true,"version":"3.22.91","mdb":"{}","skill_count":{},"name_count":{},"point_count":{},"skills":[{}],"names":[{}],"need_points":[{}]}}"#,
+        r#"{{"ok":true,"version":"{}","mdb":"{}","skill_count":{},"name_count":{},"point_count":{},"skills":[{}],"names":[{}],"need_points":[{}]}}"#,
+            PLUGIN_VERSION,
         mdb_path,
         skills.len(),
         names.len(),
@@ -16658,7 +16742,8 @@ fn read_saddles() -> String {
     drop(conn);
 
     format!(
-        r#"{{"ok":true,"version":"3.22.91","mdb":"{}","saddle_count":{},"program_chara_count":{},"program_count":{},"race_name_count":{},"chara_name_count":{},"relation_count":{},"member_count":{},"race_instance_count":{},"saddles":[{}],"chara_programs":[{}],"programs":[{}],"race_names":[{}],"chara_names":[{}],"relations":[{}],"relation_members":[{}],"race_instances":[{}]}}"#,
+        r#"{{"ok":true,"version":"{}","mdb":"{}","saddle_count":{},"program_chara_count":{},"program_count":{},"race_name_count":{},"chara_name_count":{},"relation_count":{},"member_count":{},"race_instance_count":{},"saddles":[{}],"chara_programs":[{}],"programs":[{}],"race_names":[{}],"chara_names":[{}],"relations":[{}],"relation_members":[{}],"race_instances":[{}]}}"#,
+            PLUGIN_VERSION,
         mdb_path,
         saddles.len(),
         chara_programs.len(),
@@ -20105,7 +20190,8 @@ unsafe fn read_inherit_compat() -> String {
     }
 
     format!(
-        r#"{{"version":"3.22.91","parents":{{"first_chara_id":{},"second_chara_id":{}}},"factor_count":{},"relations":[{}],"relation_members":[{}],"relation_ranks":[{}],"target_races":[{}],"route_races":[{}]}}"#,
+        r#"{{"version":"{}","parents":{{"first_chara_id":{},"second_chara_id":{}}},"factor_count":{},"relations":[{}],"relation_members":[{}],"relation_ranks":[{}],"target_races":[{}],"route_races":[{}]}}"#,
+            PLUGIN_VERSION,
         first_chara_id,
         second_chara_id,
         factor_count,
@@ -20790,7 +20876,8 @@ unsafe fn read_event_recommend() -> String {
             drop(conn);
 
             format!(
-                r#"{{"version":"3.22.91","current_state":{{"card_id":{},"scenario_id":{},"month":{},"half":{},"stats":{{"speed":{},"stamina":{},"power":{},"guts":{},"wiz":{}}},"vital":{},"max_vital":{},"skill_point":{}}},"support_card_ids":[{}],"eval_chara_ids":[{}],"total_events":{},"matching_events":{},"events":[{}],"choice_rewards":[{}]}}"#,
+                r#"{{"version":"{}","current_state":{{"card_id":{},"scenario_id":{},"month":{},"half":{},"stats":{{"speed":{},"stamina":{},"power":{},"guts":{},"wiz":{}}},"vital":{},"max_vital":{},"skill_point":{}}},"support_card_ids":[{}],"eval_chara_ids":[{}],"total_events":{},"matching_events":{},"events":[{}],"choice_rewards":[{}]}}"#,
+                    PLUGIN_VERSION,
                 card_id,
                 sid,
                 mon,
@@ -20820,13 +20907,15 @@ unsafe fn read_event_recommend() -> String {
             )
         } else {
             format!(
-                r#"{{"version":"3.22.91","error":"mdb_open_failed","current_state":{{"card_id":{},"scenario_id":{}}}}}"#,
+                r#"{{"version":"{}","error":"mdb_open_failed","current_state":{{"card_id":{},"scenario_id":{}}}}}"#,
+                    PLUGIN_VERSION,
                 card_id, sid
             )
         }
     } else {
         format!(
-            r#"{{"version":"3.22.91","error":"mdb_not_found","current_state":{{"card_id":{},"scenario_id":{}}}}}"#,
+            r#"{{"version":"{}","error":"mdb_not_found","current_state":{{"card_id":{},"scenario_id":{}}}}}"#,
+                PLUGIN_VERSION,
             card_id, sid
         )
     }
@@ -21194,7 +21283,8 @@ unsafe fn debug_gauge() -> String {
     }
 
     format!(
-        r#"{{"version":"3.22.91","count":{},"elements":[{}]}}"#,
+        r#"{{"version":"{}","count":{},"elements":[{}]}}"#,
+            PLUGIN_VERSION,
         llen,
         elems.join(",")
     )
@@ -21308,7 +21398,8 @@ unsafe fn debug_gauge2() -> String {
     }
 
     format!(
-        r#"{{"version":"3.22.91","arrays":[{}]}}"#,
+        r#"{{"version":"{}","arrays":[{}]}}"#,
+            PLUGIN_VERSION,
         results.join(",")
     )
 }
@@ -21455,7 +21546,8 @@ unsafe fn debug_paramsincdec() -> String {
     };
 
     format!(
-        r#"{{"version":"3.22.91","cmd_len":{},"cmds":[{}],"IsGaugeGained":{}}}"#,
+        r#"{{"version":"{}","cmd_len":{},"cmds":[{}],"IsGaugeGained":{}}}"#,
+            PLUGIN_VERSION,
         cmd_len,
         cmd_details.join(","),
         is_gauge_gained
@@ -25175,6 +25267,8 @@ unsafe fn exact_method_probe(uri: &str) -> String {
 }
 
 // ===== Exact single-method IL2CPP probe B1 =====
+// ===== Signup plaintext observer D1 =====
+// ===== Training animation skip D-T1 =====
 /// 辅助函数：IL2CPP类型枚举转可读名称
 fn type_enum_to_name(te: u8) -> String {
     match te {
