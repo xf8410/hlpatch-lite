@@ -1,4 +1,5 @@
 name: Release v3.28.3-lite（纯数据管道·画面映射已移除·纯构建）
+run-name: "🟢 v3.28.3-lite 纯构建 — 源码定稿版：画面映射✗已移除 · 内置AI✗已摘 · jueceramen端点✓全保留"
 
 # 新仓库纪律：CI 不改源码。拼装（cumulative/SIGSEGV guard/crash-log fix）已在
 # 提交前本地完成，仓库内 lib.rs 即最终形态；本 workflow 只做编译与发布。
@@ -14,6 +15,23 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      - name: 📝 构建账本（本版修了什么/版本演进）
+        run: |
+          cat > "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## 本 run 在做什么
+          纯构建：源码已在提交前定稿（CI 不改源码）。产物 libhachimi_ura.so → 自动挂到 Release **v3.28.3-lite**。
+          ## 版本演进账（每版修了什么）
+          | 版本 | 结果 | 相对上一版的变化 |
+          |---|---|---|
+          | v3.28.2-lite | ✅ 绿 | 首版纯构建：v3.28.2 配方移除画面映射 hook |
+          | v3.28.3-lite 首跑 | 🔴 红 | 源码升级批漏推 training_anim_skip.rs（E0583）——已当场补文件 |
+          | **v3.28.3-lite（本 run）** | 🟢 绿 | 补齐模块文件；摘内置 AI（决策归 jueceramen）；jueceramen 数据端点全保留（/summary、/api/event/choices、/api/event/observations、/debug/ramen_planner_state）；画面映射零残留（11 项校验） |
+          ## 判读规则
+          - 看最新 run：🟢 = Release 可下载可用；🔴 = 看失败步与红色说明
+          - Release 页 https://github.com/xf8410/hlpatch-lite/releases 对应 tag 资产齐全即为可用版本
+          EOF
+          echo "账本已写入 STEP_SUMMARY"
+
       - uses: actions/checkout@v4
 
       - name: Setup Rust
