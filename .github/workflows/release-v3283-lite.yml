@@ -1,4 +1,4 @@
-name: Release v3.28.2-lite（画面映射已移除·纯构建）
+name: Release v3.28.3-lite（纯数据管道·画面映射已移除·纯构建）
 
 # 新仓库纪律：CI 不改源码。拼装（cumulative/SIGSEGV guard/crash-log fix）已在
 # 提交前本地完成，仓库内 lib.rs 即最终形态；本 workflow 只做编译与发布。
@@ -45,14 +45,14 @@ jobs:
           printf '%s  %s\n' "$SHA256" libhachimi_ura.so > SHA256SUMS
           cat > BUILD-MANIFEST.txt <<EOF
           source_commit=${GITHUB_SHA}
-          cargo_version=3.28.2
+          cargo_version=3.28.3
           binary_size=$SIZE
           binary_sha256=$SHA256
-          tag=v3.28.2-lite
+          tag=v3.28.3-lite
           workflow_run=${GITHUB_RUN_ID}
-          lineage=v3.28.0(721c086)+cumulative_3.27.23+sigsegv_guard+crash_log_path_fix
+          lineage=v3.28.0(721c086)+cumulative_3.27.23+sigsegv_guard+crash_log_fix+anim_skip+signup_observer+strip_ai_v3283
           screen_mirror=removed（本仓库不注入画面映射 hook）
-          features=crash_log_path_fix,sigsegv_guard,screen_mirror_removed
+          features=crash_log_path_fix,sigsegv_guard,strip_ai_v3283,anim_skip,signup_observer,screen_mirror_removed
           runtime_validation=pending_device_execution
           EOF
           cp hachimi_ura_plugin/cargo-build.log .
@@ -63,7 +63,7 @@ jobs:
         run: |
           set -euo pipefail
           ASSET=hachimi_ura_plugin/target/aarch64-linux-android/release/libhachimi_ura.so
-          gh release create "v3.28.2-lite" "$ASSET" SHA256SUMS BUILD-MANIFEST.txt cargo-build.log \
-            --title "v3.28.2-lite（画面映射已移除）" \
-            --notes "hlpatch v3.28.2 构建配方去除画面映射 hook 的轻量版：lineage=v3.28.0(721c086)+cumulative_3.27.23+sigsegv_guard+crash_log_path_fix；源码即最终形态，CI 纯构建。" \
-            || gh release upload "v3.28.2-lite" "$ASSET" SHA256SUMS BUILD-MANIFEST.txt cargo-build.log --clobber
+          gh release create "v3.28.3-lite" "$ASSET" SHA256SUMS BUILD-MANIFEST.txt cargo-build.log \
+            --title "v3.28.3-lite 纯数据管道（画面映射已移除·内置AI已摘·jueceramen端点全保留）" \
+            --notes "hlpatch v3.28.2 构建配方去除画面映射 hook 的轻量版：lineage=v3.28.0(721c086)+cumulative_3.27.23+sigsegv_guard+crash_log_fix+anim_skip+signup_observer+strip_ai_v3283；源码即最终形态，CI 纯构建。" \
+            || gh release upload "v3.28.3-lite" "$ASSET" SHA256SUMS BUILD-MANIFEST.txt cargo-build.log --clobber
