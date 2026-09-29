@@ -12,6 +12,8 @@ crate-type = ["cdylib"]
 rusqlite = { version = "0.31", default-features = false, features = ["bundled"] }
 ureq = { version = "2", features = ["tls"] }
 libc = "0.2"
+rmpv = "1"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 3

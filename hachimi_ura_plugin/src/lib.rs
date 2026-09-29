@@ -138,8 +138,9 @@ static mut PENDING_REQ_ID: u64 = 0;
 static mut COMPRESS_REQUEST_ADDR: usize = 0;
 static mut DECOMPRESS_RESPONSE_ADDR: usize = 0;
 static mut POST_ADDR: usize = 0;
-// UnityWebRequest request-entry observer. Full capture: headers, bodies, tokens and query strings.
+// UnityWebRequest request entry and AsyncOperation completion observers.
 static mut UNITY_SEND_ADDR: usize = 0;
+static mut UNITY_COMPLETE_ADDR: usize = 0;
 // MakeMd5 hook
 static mut MAKEMD5_ADDR: usize = 0;
 static mut COMPUTEHASH_ADDR: usize = 0;
@@ -157,6 +158,36 @@ struct UnityRequestObservation {
     content_type: String,
 }
 static UNITY_OBSERVATIONS: Mutex<Vec<UnityRequestObservation>> = Mutex::new(Vec::new());
+// Completed response headers are keyed by the full request URL. Capture occurs
+// immediately before Unity dispatches the completion callback that reaches the
+// game's DecompressResponse path.
+static UNITY_COMPLETED_RESPONSE_HEADERS: Mutex<Vec<(String, Vec<(String, String)>)>> = Mutex::new(Vec::new());
+
+unsafe fn observe_unity_response_completion(operation: *mut c_void) {
+    if operation.is_null() || !SNIFF_ENABLED.load(Ordering::Relaxed) { return; }
+    let operation_class = get_class_from_object(operation);
+    if operation_class.is_null() { return; }
+    let request = call_getter_ref(operation_class, operation, "get_webRequest");
+    if request.is_null() { return; }
+    let url = unity_get_string(request, "get_url");
+    if url.is_empty() || !url.contains("/umamusume/") { return; }
+    let request_class = get_class_from_object(request);
+    if request_class.is_null() { return; }
+    let dictionary = call_getter_on_instance(request_class, request, "GetResponseHeaders");
+    if dictionary.is_null() { return; }
+    let headers = read_string_dict(dictionary);
+    if let Ok(mut completed) = UNITY_COMPLETED_RESPONSE_HEADERS.lock() {
+        completed.push((url, headers));
+    }
+}
+
+unsafe fn take_unity_response_headers(url: &str) -> Option<Vec<(String, String)>> {
+    UNITY_COMPLETED_RESPONSE_HEADERS.lock().ok().and_then(|mut completed| {
+        let wanted = sniff_path(url);
+        let index = completed.iter().position(|(candidate, _)| sniff_path(candidate) == wanted)?;
+        Some(completed.remove(index).1)
+    })
+}
 // Pending request body parking (CompressRequest → Post matching)
 static mut PENDING_REQ_BODY: Option<Vec<u8>> = None;
 static mut PENDING_COMPRESSED: usize = 0;
@@ -1458,7 +1489,115 @@ unsafe fn call_getter_obscured_int(
 // ★ v3.22.51: Direct memory read helpers — zero il2cpp calls
 // ============================================================
 
+// v3.27.23 sigsegv-guard: mapped-region validation for raw memory reads.
+// Root cause: read_summary dereferenced game objects already freed on
+// screen change (scenario/data-set swap), raising SIGSEGV -> 60s
+// recovery cooldown with empty trainings/ramen output. Any address
+// outside a currently-readable mapping is now read as null / -1.
+// Maps snapshot cached 2s; unreadable maps fail OPEN (never brick reads).
+// Original helpers renamed *_inner; same-name wrappers add the guard
+// without assuming anything about the original bodies.
+static HL_MAP_CACHE: std::sync::Mutex<Option<(u64, Vec<(usize, usize)>)>> =
+    std::sync::Mutex::new(None);
+
+fn hl_parse_maps_readable() -> Vec<(usize, usize)> {
+    let text = match std::fs::read_to_string("/proc/self/maps") {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for line in text.lines() {
+        let range = match line.split_whitespace().next() {
+            Some(r) => r,
+            None => continue,
+        };
+        let perms = line.split_whitespace().nth(1).unwrap_or("");
+        if !perms.starts_with('r') {
+            continue;
+        }
+        let mut it = range.splitn(2, '-');
+        let s = match it.next() { Some(v) => v, None => continue };
+        let e = match it.next() { Some(v) => v, None => continue };
+        let s = usize::from_str_radix(s, 16).unwrap_or(0);
+        let e = usize::from_str_radix(e, 16).unwrap_or(0);
+        if e > s {
+            out.push((s, e));
+        }
+    }
+    out
+}
+
+fn hl_ptr_mapped(addr: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut cache = match HL_MAP_CACHE.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let stale = match *cache {
+        Some((ts, _)) => now.saturating_sub(ts) >= 2,
+        None => true,
+    };
+    if stale {
+        *cache = Some((now, hl_parse_maps_readable()));
+    }
+    let regions = match cache.as_ref() {
+        Some((_, r)) => r,
+        None => return true,
+    };
+    if regions.is_empty() {
+        return true; // maps unreadable — fail open
+    }
+    let mut lo = 0usize;
+    let mut hi = regions.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let (s, e) = regions[mid];
+        if addr < s {
+            hi = mid;
+        } else if addr >= e {
+            lo = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+// v3.27.23 sigsegv-guard wrapper: unmapped holder or returned pointer -> null
+unsafe fn read_ptr_at(obj: *const c_void, field_offset: i32) -> *mut c_void {
+    if !hl_ptr_mapped(obj as usize) {
+        return std::ptr::null_mut();
+    }
+    let value = read_ptr_at_inner(obj, field_offset);
+    if !value.is_null() && !hl_ptr_mapped(value as usize) {
+        return std::ptr::null_mut(); // freed/dangling pointer read as null
+    }
+    value
+}
+
+// v3.27.23 sigsegv-guard wrapper: unmapped holder -> -1
 unsafe fn read_obscured_int_at(obj: *const c_void, field_offset: i32) -> i32 {
+    if !hl_ptr_mapped(obj as usize) {
+        return -1;
+    }
+    read_obscured_int_at_inner(obj, field_offset)
+}
+
+// v3.27.23 sigsegv-guard wrapper: unmapped holder -> -1
+unsafe fn read_int_at(obj: *const c_void, field_offset: i32) -> i32 {
+    if !hl_ptr_mapped(obj as usize) {
+        return -1;
+    }
+    read_int_at_inner(obj, field_offset)
+}
+
+unsafe fn read_obscured_int_at_inner(obj: *const c_void, field_offset: i32) -> i32 {
     if obj.is_null() || field_offset < 0 {
         return -1;
     }
@@ -1469,7 +1608,7 @@ unsafe fn read_obscured_int_at(obj: *const c_void, field_offset: i32) -> i32 {
     hidden ^ key
 }
 
-unsafe fn read_ptr_at(obj: *const c_void, field_offset: i32) -> *mut c_void {
+unsafe fn read_ptr_at_inner(obj: *const c_void, field_offset: i32) -> *mut c_void {
     if obj.is_null() || field_offset < 0 {
         return ptr::null_mut();
     }
@@ -1479,7 +1618,7 @@ unsafe fn read_ptr_at(obj: *const c_void, field_offset: i32) -> *mut c_void {
 }
 
 // ★ v3.22.51: Direct int read — zero il2cpp_runtime_invoke
-unsafe fn read_int_at(obj: *const c_void, field_offset: i32) -> i32 {
+unsafe fn read_int_at_inner(obj: *const c_void, field_offset: i32) -> i32 {
     if obj.is_null() || field_offset < 0 {
         return -1;
     }
@@ -4738,7 +4877,8 @@ unsafe fn read_summary_inner_impl() -> String {
         let y = if mon >= 4 { 1 } else { 2 };
         (y, (y - 1) * 24 + (mon - 1) * 2 + half)
     };
-    let chara_id = read_obscured_int_at(chara_obj, 36); // _cardId
+    let card_id = read_obscured_int_at(chara_obj, 36); // _cardId
+    let chara_id = call_getter_int(chara_class, chara_obj, "get_CharaId");
 
     // ★ v3.24.9: New fields — attribute caps + scenario progress + running style
     let max_spd = read_obscured_int_at(chara_obj, 348); // MaxSpeed
@@ -6557,7 +6697,7 @@ unsafe fn read_summary_inner_impl() -> String {
 
     log_predict_step("S:json");
     format!(
-        r#"{{"version":"{}","year":{},"turn":{},"raw_total_turn_num":{},"ui_turn_semantics":"countdown","raw_field_mapping":"verified_ramen_upstream_semantics","month":{},"half":{},"scenario":"{}","chara_id":{},"stats":{{"speed":{},"stamina":{},"power":{},"guts":{},"wiz":{},"vital":{},"max_vital":{},"motivation":"{}","skill_point":{},"fan":{}}},"max_stats":{{"speed":{},"stamina":{},"power":{},"guts":{},"wiz":{}}},"proper":{{"dist_short":{},"dist_mile":{},"dist_mid":{},"dist_long":{},"ground_turf":{},"ground_dirt":{}}},"running_style":{},"scenario_progress":{},"training_event_type":{},"talent_level":{},"chara_grade":{},"difficulty":{},"fixed_turn_chara_seed":{},"trainings":{},"support_cards":{},"evaluation":{},"training_levels":{},"buffs":{},"chara_effect_ids":[{}],"skills":{{"eval":{},"count":{},"list":{}}},"ai":{}{}{}{} }}"#,
+        r#"{{"version":"{}","year":{},"turn":{},"raw_total_turn_num":{},"ui_turn_semantics":"countdown","raw_field_mapping":"verified_ramen_upstream_semantics","month":{},"half":{},"scenario":"{}","card_id":{},"chara_id":{},"stats":{{"speed":{},"stamina":{},"power":{},"guts":{},"wiz":{},"vital":{},"max_vital":{},"motivation":"{}","skill_point":{},"fan":{}}},"max_stats":{{"speed":{},"stamina":{},"power":{},"guts":{},"wiz":{}}},"proper":{{"dist_short":{},"dist_mile":{},"dist_mid":{},"dist_long":{},"ground_turf":{},"ground_dirt":{}}},"running_style":{},"scenario_progress":{},"training_event_type":{},"talent_level":{},"chara_grade":{},"difficulty":{},"fixed_turn_chara_seed":{},"trainings":{},"support_cards":{},"evaluation":{},"training_levels":{},"buffs":{},"chara_effect_ids":[{}],"skills":{{"eval":{},"count":{},"list":{}}},"ai":{}{}{}{} }}"#,
         PLUGIN_VERSION,
         year,
         cumulative_turn,
@@ -6565,6 +6705,7 @@ unsafe fn read_summary_inner_impl() -> String {
         mon,
         half,
         scn_s,
+        card_id,
         chara_id,
         spd,
         sta,
@@ -7428,6 +7569,23 @@ fn handle_http(mut stream: std::net::TcpStream) {
     // that touches game memory; static/self-state endpoints stay available.
     if !GAME_INITIALIZED.load(Ordering::Relaxed) {
         const BOOT_SAFE_EXACT: &[&str] = &[
+    "/il2cpp/exact_method",
+    "/runtime/init_status",
+    "/hooks/registry",
+    "/hooks/diagnostics",
+    "/capture/status",
+    "/storage/status",
+    "/storage/sessions",
+    "/storage/session",
+    "/storage/files",
+    "/storage/download",
+    "/storage/turn_event_jsons",
+    "/storage/read_range",
+    "/storage/flush",
+    "/storage/recover",
+    "/storage/audit",
+    "/api/sniff/exchange",
+    "/api/sniff/exchanges",
             "/",
             "/health",
             "/status",
@@ -7533,6 +7691,11 @@ fn handle_http(mut stream: std::net::TcpStream) {
     let dl_name = parse_query(&full_uri, "name");
     let dl_enabled = !dl_flag.is_empty() && dl_flag != "0" && DL_ALLOWED.iter().any(|p| path == *p);
 
+    let _parsed_request_uri = parse_request_uri(req).unwrap_or_else(|_| full_uri.to_string());
+    if path == "/storage/read_range" {
+        storage_read_range(&mut stream, &full_uri);
+        return;
+    }
     let body = if path == "/debug/global_metadata_probe" {
         safe_mem_scan(req, true)
     } else if path == "/debug/mem_scan_hex" {
@@ -7541,7 +7704,7 @@ fn handle_http(mut stream: std::net::TcpStream) {
         safe_maps_summary()
     } else if path == "/" || path == "/health" {
         format!(
-            r#"{{"status":"ok","version":"{}","endpoints":["/summary","/data","/scenario","/debug/rameninfo","/debug/laststep","/event/recommend","/inherit/compat","/saddle-analysis","/log/turn","/debug/params","/debug/breeders","/debug/cmdinfo","/debug/training_partners","/debug/crashlog","/debug/upload","/debug/dumpclass","/debug/storydata","/debug/ramenfields","/debug/gauge","/debug/gauge2","/debug/ramengains","/debug/paramsincdec","/debug/training_seed","/debug/training_log","/debug/training_log_dl","/update","/update/status","/debug/all","/debug/unique_skills","/debug/mdb_all_tables","/debug/mdb_schema_dump","/debug/hint_gain","/debug/sc_effect","/debug/unique_detail","/debug/table","/debug/push_table","/debug/download_table","/mdb","/carddb","/skilldata","/hall","/saddles","/saddles-dl","/log","/status","/health","/mdb/schema","/mdb/search","/mdb/raw","/mdb/dl_batch","/il2cpp/dump","/il2cpp/call","/il2cpp/tree","/il2cpp/field","/il2cpp/classes","/il2cpp/static","/il2cpp/methods","/il2cpp/disassemble","/il2cpp/disassemble_dl","/il2cpp/disassemble_addr","/il2cpp/disassemble_addr_dl","/il2cpp/dump_all_methods","/il2cpp/dump_all_methods_dl","/il2cpp/search_float","/il2cpp/search_float_dl","/il2cpp/search_int","/il2cpp/search_int_dl","/il2cpp/search_methods","/il2cpp/search_methods_dl","/il2cpp/read_mem","/il2cpp/read_mem_dl","/training/result","/api/sniff","/api/sniff/metadata","/api/sniff/status","/api/sniff/toggle","/api/sniff/clear","/api/sniff/diag","/api/event/choices","/api/event/clear","/debug/hooklog","/debug/hookdiag","/debug/resource_meta_key","/debug/resource_db_keys","/debug/resource_reads","/debug/mem_scan_sqlite","/debug/meta_dump","/action/latest","/seed/history","/seed/stats","/debug/ramen_planner_state","/debug/ramen_participants","/debug/ramen_transition","/debug/ramen_dataset_path","/debug/ramen_formula_targets","/debug/event_reward_targets", "/debug/resource_storage","/debug/resource_meta_schema","/debug/resource_meta_probe", "/debug/resource_crypto_symbols","/debug/resource_meta_dl","/debug/resource_file_dl","/debug/private_file_inventory","/debug/private_file_dl"]}}"#,
+            r#"{{"status":"ok","version":"{}","endpoints":[\"/inherit/tree\",\"/inherit/parent_records\",\"/inherit/race_history\",\"/inherit/race_compat\",\"/inherit/full_compat\",\"/inherit/compat_trace\",\"/inherit/factor_tree\",\"/inherit/bonus_params\",\"/inherit/event_trace\",\"/inherit/deck_runtime\",\"/inherit/deck_validate\",\"/inherit/friend_rental_context\",\"/inherit/auto_select_trace\",\"/autoplay/runtime\",\"/autoplay/plan\",\"/autoplay/action_trace\",\"/autoplay/factor_select_trace\",\"/offline_auto/runtime\",\"/offline_auto/start_request\",\"/offline_auto/race_reserve\",\"/offline_auto/result\",\"/generate_succession/status\",\"/generate_succession/limits\",\"/generate_succession/request\",\"/generate_succession/result\",\"/generate_succession/candidates\",\"/generate_succession/race_reserve\",\"/generate_succession/race_validation\",\"/generate_succession/factor_priority\",\"/generate_succession/factor_order\",\"/generate_succession/probability_trace\",\"/generate_succession/cost_trace\",\"/factor/finish_trace\",\"/factor/candidates\",\"/factor/roll_trace\",\"/factor/probability_model\",\"/factor/history\",\"/factor/stats\",\"/factor/breeding_advice\",\"/il2cpp/call_targets\",\"/il2cpp/callers\",\"/il2cpp/type_detail\",\"/il2cpp/object_dump\",\"/api/sniff/exchanges\",\"/api/sniff/exchange\",\"/api/hook/install\",\"/api/hook/remove\",\"/api/hook/list\",\"/api/hook/events\",\"/storage/files\",\"/storage/download\","/storage/status","/storage/sessions","/storage/session","/storage/flush","/storage/recover","/il2cpp/method_index_status","/il2cpp/method_by_addr","/il2cpp/method_detail","/il2cpp/nested_types","/il2cpp/enum_values","/inherit/pair_compat","/inherit/selected_parent_runtime","/summary","/data","/scenario","/debug/rameninfo","/debug/laststep","/event/recommend","/inherit/compat","/saddle-analysis","/log/turn","/debug/params","/debug/breeders","/debug/cmdinfo","/debug/training_partners","/debug/crashlog","/debug/upload","/debug/dumpclass","/debug/storydata","/debug/ramenfields","/debug/gauge","/debug/gauge2","/debug/ramengains","/debug/paramsincdec","/debug/training_seed","/debug/training_log","/debug/training_log_dl","/update","/update/status","/debug/all","/debug/unique_skills","/debug/mdb_all_tables","/debug/mdb_schema_dump","/debug/hint_gain","/debug/sc_effect","/debug/unique_detail","/debug/table","/debug/push_table","/debug/download_table","/mdb","/carddb","/skilldata","/hall","/saddles","/saddles-dl","/log","/status","/health","/mdb/schema","/mdb/search","/mdb/raw","/mdb/dl_batch","/il2cpp/dump","/il2cpp/call","/il2cpp/tree","/il2cpp/field","/il2cpp/classes","/il2cpp/static","/il2cpp/methods","/il2cpp/disassemble","/il2cpp/disassemble_dl","/il2cpp/disassemble_addr","/il2cpp/disassemble_addr_dl","/il2cpp/dump_all_methods","/il2cpp/dump_all_methods_dl","/il2cpp/search_float","/il2cpp/search_float_dl","/il2cpp/search_int","/il2cpp/search_int_dl","/il2cpp/search_methods","/il2cpp/search_methods_dl","/il2cpp/read_mem","/il2cpp/read_mem_dl","/training/result","/api/sniff","/api/sniff/metadata","/api/sniff/status","/api/sniff/toggle","/api/sniff/clear","/api/sniff/diag","/api/event/choices","/api/event/clear","/debug/hooklog","/debug/hookdiag","/debug/resource_meta_key","/debug/resource_db_keys","/debug/resource_reads","/debug/mem_scan_sqlite","/debug/meta_dump","/action/latest","/seed/history","/seed/stats","/debug/ramen_planner_state","/debug/ramen_participants","/debug/ramen_transition","/debug/ramen_dataset_path","/debug/ramen_formula_targets","/debug/event_reward_targets", "/debug/resource_storage","/debug/resource_meta_schema","/debug/resource_meta_probe", "/debug/resource_crypto_symbols","/debug/resource_meta_dl","/debug/resource_file_dl","/debug/private_file_inventory","/debug/private_file_dl"]}}"#,
             PLUGIN_VERSION
         )
     } else if path == "/scan" {
@@ -7785,6 +7948,9 @@ fn handle_http(mut stream: std::net::TcpStream) {
             SNIFF_RESPONSES.clear();
             if let Ok(mut entries) = UNITY_OBSERVATIONS.lock() {
                 entries.clear();
+            }
+            if let Ok(mut completed) = UNITY_COMPLETED_RESPONSE_HEADERS.lock() {
+                completed.clear();
             }
             SNIFF_METADATA.clear();
             SNIFF_RESPONSE_QUEUE.clear();
@@ -8725,10 +8891,16 @@ fn handle_http(mut stream: std::net::TcpStream) {
         unsafe { read_hall_data() }
     } else if path == "/event/recommend" {
         unsafe { read_event_recommend() }
+    } else if path == "/inherit/selected_parent_records" {
+        unsafe { inherit_selected_parent_records_endpoint() }
+    } else if path == "/inherit/selected_parent_runtime" {
+        unsafe { inherit_selected_parent_runtime_endpoint() }
+    } else if path == "/inherit/pair_compat" {
+        inherit_pair_compat_endpoint(&full_uri)
     } else if path == "/inherit/compat" {
-        unsafe { read_inherit_compat() }
+        r#"{"ok":false,"status":"deprecated","error":"legacy_inherit_contract_unreliable","replacement":"/inherit/pair_compat and /inherit/selected_parent_runtime"}"#.to_string()
     } else if path == "/saddle-analysis" {
-        unsafe { read_win_saddle_analysis() }
+        r#"{"ok":false,"status":"unavailable","error":"legacy_saddle_runtime_chain_unverified"}"#.to_string()
     } else if path == "/log/turn" {
         unsafe { read_turn_log() }
     } else if path == "/ranking" {
@@ -8906,6 +9078,144 @@ fn handle_http(mut stream: std::net::TcpStream) {
         // v3.22.89: 读取静态类常量值（方案B）
         let class_name = parse_query(&full_uri, "name");
         unsafe { il2cpp_read_static_fields(&class_name) }
+    } else if path == "/runtime/init_status" {
+        unsafe { foundation_init_status_endpoint() }
+    } else if path == "/hooks/registry" {
+        unsafe { foundation_hook_registry_endpoint() }
+    } else if path == "/hooks/diagnostics" {
+        foundation_hook_diagnostics_endpoint()
+    } else if path == "/capture/status" {
+        foundation_capture_status_endpoint()
+    } else if path == "/storage/turn_event_jsons" {
+        storage_turn_event_jsons(&full_uri)
+    } else if path == "/storage/files" {
+        storage_files_endpoint(&full_uri)
+    } else if path == "/storage/download" {
+        storage_download(&full_uri)
+    } else if path == "/il2cpp/call_targets" {
+        unsafe { il2cpp_call_targets(&full_uri) }
+    } else if path == "/il2cpp/callers" {
+        unsafe { il2cpp_callers(&full_uri) }
+    } else if path == "/il2cpp/type_detail" {
+        unsafe { il2cpp_type_detail(&full_uri) }
+    } else if path == "/il2cpp/object_dump" {
+        unsafe { il2cpp_object_dump(&full_uri) }
+    } else if path == "/inherit/tree" {
+        unsafe { inherit_tree_endpoint() }
+    } else if path == "/inherit/parent_records" {
+        unsafe { inherit_selected_parent_records_endpoint() }
+    } else if path == "/inherit/race_history" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/inherit/race_compat" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/inherit/full_compat" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/inherit/compat_trace" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/inherit/factor_tree" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/inherit/bonus_params" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/inherit/event_trace" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/inherit/deck_runtime" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/inherit/deck_validate" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/inherit/friend_rental_context" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/inherit/auto_select_trace" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/autoplay/runtime" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/autoplay/plan" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/autoplay/action_trace" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/autoplay/factor_select_trace" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/offline_auto/runtime" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/offline_auto/start_request" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/offline_auto/race_reserve" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/offline_auto/result" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/generate_succession/status" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/generate_succession/limits" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/generate_succession/request" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/generate_succession/runtime_full" {
+        unsafe { generated_succession_runtime_endpoint() }
+    } else if path == "/generate_succession/result" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/generate_succession/candidates" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/generate_succession/race_reserve" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/generate_succession/race_validation" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/generate_succession/factor_priority" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/generate_succession/factor_order" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/generate_succession/probability_trace" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/generate_succession/cost_trace" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/factor/finish_trace" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/factor/candidates" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/factor/roll_trace" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/factor/probability_model" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/factor/history" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/factor/stats" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/factor/breeding_advice" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/api/sniff/exchanges" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/api/sniff/exchange" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/api/hook/install" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/api/hook/remove" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/api/hook/list" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/api/hook/events" {
+        k_domain_endpoint(&path, &full_uri)
+    } else if path == "/storage/audit" {
+        protocol_archive_audit_endpoint(&full_uri)
+    } else if path == "/storage/status" {
+        storage_status_endpoint()
+    } else if path == "/storage/sessions" {
+        storage_sessions_endpoint()
+    } else if path == "/storage/session" {
+        storage_session_endpoint(&full_uri)
+    } else if path == "/storage/flush" {
+        storage_flush_endpoint()
+    } else if path == "/storage/recover" {
+        storage_recover_endpoint()
+    } else if path == "/il2cpp/method_index_status" {
+        method_index_status_endpoint(&full_uri)
+    } else if path == "/il2cpp/method_by_addr" {
+        unsafe { il2cpp_method_by_addr(&full_uri) }
+    } else if path == "/il2cpp/exact_method" {
+        unsafe { exact_method_probe(&full_uri) }
+    } else if path == "/il2cpp/method_detail" {
+        unsafe { il2cpp_method_detail(&full_uri) }
+    } else if path == "/il2cpp/nested_types" {
+        unsafe { il2cpp_nested_types(&full_uri) }
+    } else if path == "/il2cpp/enum_values" {
+        unsafe { il2cpp_enum_values_capability(&full_uri) }
     } else if path.starts_with("/il2cpp/methods") {
         // v3.22.89: 列出类的所有方法名和参数数量
         let class_name = parse_query(&full_uri, "name");
@@ -9198,7 +9508,7 @@ fn handle_http(mut stream: std::net::TcpStream) {
         }
     } else {
         format!(
-            r#"{{"error":"not_found","path":"{}","available":["/scan","/data","/status","/health","/scenario","/debug/upload","/debug/rameninfo","/debug/laststep","/event/recommend","/inherit/compat","/saddle-analysis","/log/turn","/log","/debug/params","/fields","/methods","/singletons","/find_method","/classes","/carddb","/skilldata","/hall","/debug/breeders","/debug/cmdinfo","/debug/training_partners","/debug/ramengains","/debug/paramsincdec","/debug/training_seed","/debug/training_log","/debug/training_log_dl","/update","/update/status","/debug/dumpclass","/debug/storydata","/debug/ramenfields","/debug/all","/mdb","/debug/push_table","/debug/download_table","/classes/search/keyword","/mdb/schema","/mdb/search","/mdb/raw","/mdb/dl_batch","/il2cpp/dump","/il2cpp/call","/il2cpp/tree","/il2cpp/field","/il2cpp/classes","/il2cpp/static","/il2cpp/methods","/il2cpp/search_float","/il2cpp/search_float_dl","/il2cpp/search_int","/il2cpp/search_int_dl","/il2cpp/search_methods","/il2cpp/search_methods_dl","/il2cpp/search_methods_page","/il2cpp/read_mem","/il2cpp/read_mem_dl","/training/result","/api/sniff","/api/sniff/metadata","/api/sniff/status","/api/sniff/toggle","/api/sniff/clear","/api/sniff/diag","/api/event/choices","/api/event/clear"]}}"#,
+            r#"{{"error":"not_found","path":"{}","available":[\"/inherit/tree\",\"/inherit/parent_records\",\"/inherit/race_history\",\"/inherit/race_compat\",\"/inherit/full_compat\",\"/inherit/compat_trace\",\"/inherit/factor_tree\",\"/inherit/bonus_params\",\"/inherit/event_trace\",\"/inherit/deck_runtime\",\"/inherit/deck_validate\",\"/inherit/friend_rental_context\",\"/inherit/auto_select_trace\",\"/autoplay/runtime\",\"/autoplay/plan\",\"/autoplay/action_trace\",\"/autoplay/factor_select_trace\",\"/offline_auto/runtime\",\"/offline_auto/start_request\",\"/offline_auto/race_reserve\",\"/offline_auto/result\",\"/generate_succession/status\",\"/generate_succession/limits\",\"/generate_succession/request\",\"/generate_succession/result\",\"/generate_succession/candidates\",\"/generate_succession/race_reserve\",\"/generate_succession/race_validation\",\"/generate_succession/factor_priority\",\"/generate_succession/factor_order\",\"/generate_succession/probability_trace\",\"/generate_succession/cost_trace\",\"/factor/finish_trace\",\"/factor/candidates\",\"/factor/roll_trace\",\"/factor/probability_model\",\"/factor/history\",\"/factor/stats\",\"/factor/breeding_advice\",\"/il2cpp/call_targets\",\"/il2cpp/callers\",\"/il2cpp/type_detail\",\"/il2cpp/object_dump\",\"/api/sniff/exchanges\",\"/api/sniff/exchange\",\"/api/hook/install\",\"/api/hook/remove\",\"/api/hook/list\",\"/api/hook/events\",\"/storage/files\",\"/storage/download\","/storage/status","/storage/sessions","/storage/session","/storage/flush","/storage/recover","/il2cpp/method_index_status","/il2cpp/method_by_addr","/il2cpp/method_detail","/il2cpp/nested_types","/il2cpp/enum_values","/inherit/pair_compat","/inherit/selected_parent_runtime","/scan","/data","/status","/health","/scenario","/debug/upload","/debug/rameninfo","/debug/laststep","/event/recommend","/inherit/compat","/saddle-analysis","/log/turn","/log","/debug/params","/fields","/methods","/singletons","/find_method","/classes","/carddb","/skilldata","/hall","/debug/breeders","/debug/cmdinfo","/debug/training_partners","/debug/ramengains","/debug/paramsincdec","/debug/training_seed","/debug/training_log","/debug/training_log_dl","/update","/update/status","/debug/dumpclass","/debug/storydata","/debug/ramenfields","/debug/all","/mdb","/debug/push_table","/debug/download_table","/classes/search/keyword","/mdb/schema","/mdb/search","/mdb/raw","/mdb/dl_batch","/il2cpp/dump","/il2cpp/call","/il2cpp/tree","/il2cpp/field","/il2cpp/classes","/il2cpp/static","/il2cpp/methods","/il2cpp/search_float","/il2cpp/search_float_dl","/il2cpp/search_int","/il2cpp/search_int_dl","/il2cpp/search_methods","/il2cpp/search_methods_dl","/il2cpp/search_methods_page","/il2cpp/read_mem","/il2cpp/read_mem_dl","/training/result","/api/sniff","/api/sniff/metadata","/api/sniff/status","/api/sniff/toggle","/api/sniff/clear","/api/sniff/diag","/api/event/choices","/api/event/clear"]}}"#,
             path
         )
     };
@@ -9779,12 +10089,11 @@ unsafe fn read_il2cpp_byte_array(arr: *const c_void) -> Vec<u8> {
         return vec![];
     }
     let len = std::ptr::read::<u64>((arr as *const u8).offset(24) as *const u64) as usize;
-    if len == 0 || len > 2 * 1024 * 1024 {
+    if len == 0 {
         return vec![];
     }
-    let cap = len.min(65536);
     let data_ptr = (arr as *const u8).offset(32);
-    std::slice::from_raw_parts(data_ptr, cap).to_vec()
+    std::slice::from_raw_parts(data_ptr, len).to_vec()
 }
 
 fn sniff_timestamp() -> u64 {
@@ -9956,6 +10265,21 @@ extern "C" fn unity_send_hook_handler(this: *mut c_void) -> *mut c_void {
     }
 }
 
+// AsyncOperation.InvokeCompletionEvent runs after response headers are available
+// and immediately before Unity invokes the request completion callbacks.
+extern "C" fn unity_complete_hook_handler(this: *mut c_void) {
+    unsafe {
+        let trampoline = interceptor_get_trampoline(unity_complete_hook_handler as usize);
+        if trampoline == 0 { return; }
+        type FnType = unsafe extern "C" fn(*mut c_void);
+        let original: FnType = std::mem::transmute(trampoline);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observe_unity_response_completion(this);
+        }));
+        original(this);
+    }
+}
+
 // MakeMd5(string input) -> string
 // Hook to capture MD5 input (contains salt) and output
 extern "C" fn makemd5_hook_handler(input: *mut c_void) -> *mut c_void {
@@ -10122,7 +10446,19 @@ extern "C" fn decompress_response_hook_handler(data: *mut c_void) -> *mut c_void
                 } else {
                     SNIFF_RESPONSE_QUEUE.remove(0)
                 };
-                push_sniff_metadata(rid, "response", &response_url, bytes.len(), &bytes, Vec::new());
+                let response_headers = take_unity_response_headers(&response_url);
+                let response_headers_json = response_headers.as_ref().map(|headers| format_headers_json(headers));
+                match (response_headers, response_headers_json) {
+                    (Some(headers), Some(headers_json)) => {
+                        push_sniff_metadata(rid, "response", &response_url, bytes.len(), &bytes, headers);
+                        if let Err(error) = persist_protocol_capture("response", rid, &response_url, headers_json.as_bytes(), &bytes) { storage_set_error(&error); }
+                    }
+                    _ => {
+                        storage_set_error("response_headers_not_correlated");
+                        push_sniff_metadata(rid, "response", &response_url, bytes.len(), &bytes, Vec::new());
+                        if let Err(error) = persist_protocol_capture("response", rid, &response_url, &[], &bytes) { storage_set_error(&error); }
+                    }
+                }
                 SNIFF_RESPONSES.push((rid, bytes));
                 if SNIFF_RESPONSES.len() > SNIFF_RAW_MAX {
                     SNIFF_RESPONSES.remove(0);
@@ -10183,6 +10519,7 @@ extern "C" fn post_hook_handler(
                 if SNIFF_RESPONSE_QUEUE.len() > SNIFF_METADATA_MAX {
                     SNIFF_RESPONSE_QUEUE.remove(0);
                 }
+                if let Err(error) = persist_protocol_capture("request", rid, &url_str, headers_json.as_bytes(), &body) { storage_set_error(&error); }
                 SNIFF_REQUESTS.push((rid, url_str, headers_json, body));
                 if SNIFF_REQUESTS.len() > SNIFF_RAW_MAX {
                     SNIFF_REQUESTS.remove(0);
@@ -10971,10 +11308,12 @@ unsafe fn find_class_fuzzy(image: *const c_void, substr: &str) -> *mut c_void {
 }
 
 unsafe fn install_api_sniff_hooks() {
+    install_text_common_observer_hook();
     let all_hooked = COMPRESS_REQUEST_ADDR != 0
         && DECOMPRESS_RESPONSE_ADDR != 0
         && POST_ADDR != 0
-        && UNITY_SEND_ADDR != 0;
+        && UNITY_SEND_ADDR != 0
+        && UNITY_COMPLETE_ADDR != 0;
     if all_hooked {
         return;
     }
@@ -11046,6 +11385,32 @@ unsafe fn install_api_sniff_hooks() {
                     );
                 } else {
                     set_hook_status("sniff.unity_send", "failed: interceptor_hook");
+                }
+            }
+        }
+    }
+
+    if UNITY_COMPLETE_ADDR == 0 {
+        let core_image = get_asm(to_cstr("UnityEngine.CoreModule.dll").as_ptr());
+        if core_image.is_null() {
+            set_hook_status("sniff.unity_complete", "failed: image_not_found");
+        } else {
+            let async_operation = get_class(
+                core_image,
+                to_cstr("UnityEngine").as_ptr(),
+                to_cstr("AsyncOperation").as_ptr(),
+            );
+            if async_operation.is_null() {
+                set_hook_status("sniff.unity_complete", "failed: class_not_found");
+            } else {
+                let addr = get_method_addr(async_operation as usize, to_cstr("InvokeCompletionEvent").as_ptr(), 0);
+                if addr == 0 {
+                    set_hook_status("sniff.unity_complete", "failed: method_not_found");
+                } else if interceptor_hook(addr, unity_complete_hook_handler as usize) {
+                    UNITY_COMPLETE_ADDR = addr;
+                    set_hook_status("sniff.unity_complete", &format!("hooked@0x{:x}", addr));
+                } else {
+                    set_hook_status("sniff.unity_complete", "failed: interceptor_hook");
                 }
             }
         }
@@ -12219,7 +12584,7 @@ pub unsafe extern "C" fn hachimi_init_v3(
     init_crash_handler();
     boot_trace("BEGIN");
     boot_trace("crash_handler_ok");
-    ura_log(3, "URA plugin v3.24.9 loaded (Interceptor API hooks)");
+    ura_log(3, &format!("URA plugin {} loaded (Interceptor API hooks)", PLUGIN_VERSION));
 
     // ★ v3.24.44: capture SQLCipher key EARLY — the game keys `meta`
     // during boot, possibly before on_game_initialized fires.
@@ -22285,6 +22650,2531 @@ unsafe fn il2cpp_list_methods(class_name: &str) -> String {
     )
 }
 
+// ===== Unified observation endpoint A-stage =====
+// The index is built once per game process. Addresses are stored as usize so the
+// synchronized state never contains raw pointers shared between threads.
+#[derive(Clone)]
+struct MethodIndexEntry {
+    method_info: usize,
+    method_pointer: usize,
+    namespace: String,
+    declaring_type: String,
+    method_name: String,
+    return_type: String,
+    parameter_names: Vec<Option<String>>,
+    parameter_types: Vec<String>,
+    flags: u32,
+}
+
+struct MethodIndexState {
+    status: &'static str,
+    error: String,
+    entries: Vec<MethodIndexEntry>,
+    image_class_count: u32,
+    indexed_class_count: u32,
+    indexed_method_count: usize,
+    null_method_pointer_count: usize,
+    duplicate_method_pointer_count: usize,
+    generation: u64,
+    started_at_ms: u64,
+    heartbeat_at_ms: u64,
+    worker_active: bool,
+}
+
+static METHOD_INDEX: Mutex<MethodIndexState> = Mutex::new(MethodIndexState {
+    status: "empty",
+    error: String::new(),
+    entries: Vec::new(),
+    image_class_count: 0,
+    indexed_class_count: 0,
+    indexed_method_count: 0,
+    null_method_pointer_count: 0,
+    duplicate_method_pointer_count: 0,
+    generation: 0,
+    started_at_ms: 0,
+    heartbeat_at_ms: 0,
+    worker_active: false,
+});
+
+fn method_index_now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_millis() as u64
+}
+
+fn percent_decode_component(input: &str) -> Result<String, String> {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                if index + 2 >= bytes.len() {
+                    return Err("incomplete_percent_escape".to_string());
+                }
+                let hex = &input[index + 1..index + 3];
+                let value = u8::from_str_radix(hex, 16)
+                    .map_err(|_| "invalid_percent_escape".to_string())?;
+                output.push(value);
+                index += 3;
+            }
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            value => {
+                output.push(value);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(output).map_err(|_| "query_not_utf8".to_string())
+}
+
+fn parse_request_uri(request: &str) -> Result<String, String> {
+    let line = request.lines().next().ok_or_else(|| "missing_request_line".to_string())?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next().ok_or_else(|| "missing_http_method".to_string())?;
+    let uri = parts.next().ok_or_else(|| "missing_request_uri".to_string())?;
+    let version = parts.next().ok_or_else(|| "missing_http_version".to_string())?;
+    if method.is_empty() || !version.starts_with("HTTP/") || parts.next().is_some() {
+        return Err("invalid_request_line".to_string());
+    }
+    Ok(uri.to_string())
+}
+
+fn parse_query_pairs(uri: &str) -> Result<Vec<(String, String)>, String> {
+    let query = match uri.split_once('?') {
+        Some((_, value)) => value.split('#').next().unwrap_or(""),
+        None => return Ok(Vec::new()),
+    };
+    let mut pairs = Vec::new();
+    for item in query.split('&') {
+        if item.is_empty() { continue; }
+        let (raw_key, raw_value) = item.split_once('=').unwrap_or((item, ""));
+        pairs.push((percent_decode_component(raw_key)?, percent_decode_component(raw_value)?));
+    }
+    Ok(pairs)
+}
+
+fn query_pair(pairs: &[(String, String)], name: &str) -> String {
+    pairs.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone()).unwrap_or_default()
+}
+
+fn parse_address(value: &str) -> Option<usize> {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        usize::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<usize>().ok()
+    }
+}
+
+unsafe fn il2cpp_c_string(pointer: *const c_char) -> String {
+    if pointer.is_null() { String::new() } else { CStr::from_ptr(pointer).to_string_lossy().into_owned() }
+}
+
+unsafe fn class_full_declaring_name(class: *mut c_void) -> String {
+    if class.is_null() { return String::new(); }
+    let get_name_ptr = resolve_il2cpp_symbol("il2cpp_class_get_name");
+    let get_namespace_ptr = resolve_il2cpp_symbol("il2cpp_class_get_namespace");
+    let get_declaring_ptr = resolve_il2cpp_symbol("il2cpp_class_get_declaring_type");
+    if get_name_ptr.is_null() || get_namespace_ptr.is_null() || get_declaring_ptr.is_null() {
+        return String::new();
+    }
+    let get_name: unsafe extern "C" fn(*mut c_void) -> *const c_char = std::mem::transmute(get_name_ptr);
+    let get_namespace: unsafe extern "C" fn(*mut c_void) -> *const c_char = std::mem::transmute(get_namespace_ptr);
+    let get_declaring: unsafe extern "C" fn(*mut c_void) -> *mut c_void = std::mem::transmute(get_declaring_ptr);
+    let mut names = Vec::new();
+    let mut current = class;
+    let mut namespace = String::new();
+    for _ in 0..64 {
+        if current.is_null() { break; }
+        names.push(il2cpp_c_string(get_name(current)));
+        namespace = il2cpp_c_string(get_namespace(current));
+        current = get_declaring(current);
+    }
+    names.reverse();
+    let chain = names.join("/");
+    if namespace.is_empty() { chain } else { format!("{}.{}", namespace, chain) }
+}
+
+unsafe fn find_class_by_full_declaring_name(requested: &str) -> *mut c_void {
+    let image = get_image();
+    if image.is_null() || requested.is_empty() { return ptr::null_mut(); }
+    let (namespace, type_chain) = match requested.split_once('.') {
+        Some((namespace, rest)) => (namespace, rest),
+        None => ("", requested),
+    };
+    let mut names = type_chain.split('/');
+    let outer = match names.next() { Some(value) if !value.is_empty() => value, _ => return ptr::null_mut() };
+    let mut class = find_class(image, to_cstr(namespace).as_ptr(), to_cstr(outer).as_ptr());
+    if class.is_null() { return ptr::null_mut(); }
+    let nested_ptr = resolve_il2cpp_symbol("il2cpp_class_get_nested_types");
+    let name_ptr = resolve_il2cpp_symbol("il2cpp_class_get_name");
+    if names.clone().next().is_some() && (nested_ptr.is_null() || name_ptr.is_null()) { return ptr::null_mut(); }
+    let get_nested: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> *mut c_void = std::mem::transmute(nested_ptr);
+    let get_name: unsafe extern "C" fn(*mut c_void) -> *const c_char = std::mem::transmute(name_ptr);
+    for requested_nested in names {
+        let mut iterator = ptr::null_mut();
+        let mut found: *mut c_void = ptr::null_mut();
+        loop {
+            let candidate = get_nested(class, &mut iterator);
+            if candidate.is_null() { break; }
+            if il2cpp_c_string(get_name(candidate)) == requested_nested {
+                if !found.is_null() { return ptr::null_mut(); }
+                found = candidate;
+            }
+        }
+        if found.is_null() { return ptr::null_mut(); }
+        class = found;
+    }
+    class
+}
+
+unsafe fn build_method_index(generation: u64) -> Result<Vec<MethodIndexEntry>, String> {
+    let image = get_image();
+    if image.is_null() { return Err("image_null".to_string()); }
+    let symbols = [
+        "il2cpp_image_get_class_count", "il2cpp_image_get_class", "il2cpp_class_get_methods",
+        "il2cpp_method_get_name", "il2cpp_method_get_param_count", "il2cpp_method_get_param",
+        "il2cpp_method_get_param_name", "il2cpp_method_get_return_type", "il2cpp_type_get_name",
+        "il2cpp_method_get_flags", "il2cpp_method_get_class",
+    ];
+    let resolved: Vec<*mut c_void> = symbols.iter().map(|name| resolve_il2cpp_symbol(name)).collect();
+    if let Some(index) = resolved.iter().position(|value| value.is_null()) {
+        return Err(format!("missing_symbol:{}", symbols[index]));
+    }
+    let get_class_count: FnImageGetClassCount = std::mem::transmute(resolved[0]);
+    let get_class: FnImageGetClass = std::mem::transmute(resolved[1]);
+    let get_methods: FnClassGetMethods = std::mem::transmute(resolved[2]);
+    let get_method_name: FnMethodGetName = std::mem::transmute(resolved[3]);
+    let get_param_count: unsafe extern "C" fn(*const c_void) -> u32 = std::mem::transmute(resolved[4]);
+    let get_param: unsafe extern "C" fn(*const c_void, u32) -> *const c_void = std::mem::transmute(resolved[5]);
+    let get_param_name: unsafe extern "C" fn(*const c_void, u32) -> *const c_char = std::mem::transmute(resolved[6]);
+    let get_return_type: unsafe extern "C" fn(*const c_void) -> *const c_void = std::mem::transmute(resolved[7]);
+    let get_type_name: unsafe extern "C" fn(*const c_void) -> *const c_char = std::mem::transmute(resolved[8]);
+    let get_flags: unsafe extern "C" fn(*const c_void, *mut u32) -> u32 = std::mem::transmute(resolved[9]);
+    let get_method_class: unsafe extern "C" fn(*const c_void) -> *mut c_void = std::mem::transmute(resolved[10]);
+    let mut entries = Vec::new();
+    let class_count = get_class_count(image);
+    {
+        let mut state = METHOD_INDEX.lock().unwrap_or_else(|error| error.into_inner());
+        if state.generation != generation { return Err("method_index_generation_superseded".to_string()); }
+        state.image_class_count = class_count;
+        state.heartbeat_at_ms = method_index_now_ms();
+    }
+    for class_index in 0..class_count {
+        if class_index % 32 == 0 {
+            let now = method_index_now_ms();
+            let mut state = METHOD_INDEX.lock().unwrap_or_else(|error| error.into_inner());
+            if state.generation != generation { return Err("method_index_generation_superseded".to_string()); }
+            if now.saturating_sub(state.started_at_ms) > 180_000 { return Err("method_index_build_timeout".to_string()); }
+            state.indexed_class_count = class_index;
+            state.indexed_method_count = entries.len();
+            state.heartbeat_at_ms = now;
+        }
+        let class = get_class(image, class_index);
+        if class.is_null() { continue; }
+        let mut iterator = ptr::null_mut();
+        loop {
+            let method_info = get_methods(class, &mut iterator);
+            if method_info.is_null() { break; }
+            let declaring_class = get_method_class(method_info);
+            let declaring_type = class_full_declaring_name(declaring_class);
+            let namespace = declaring_type.split_once('.').map(|(value, _)| value.to_string()).unwrap_or_default();
+            let parameter_count = get_param_count(method_info);
+            let mut parameter_names = Vec::with_capacity(parameter_count as usize);
+            let mut parameter_types = Vec::with_capacity(parameter_count as usize);
+            for parameter_index in 0..parameter_count {
+                let parameter_type = get_param(method_info, parameter_index);
+                parameter_types.push(if parameter_type.is_null() { "unresolved".to_string() } else { il2cpp_c_string(get_type_name(parameter_type)) });
+                let parameter_name = il2cpp_c_string(get_param_name(method_info, parameter_index));
+                parameter_names.push(if parameter_name.is_empty() { None } else { Some(parameter_name) });
+            }
+            let return_type_pointer = get_return_type(method_info);
+            let return_type = if return_type_pointer.is_null() { "unresolved".to_string() } else { il2cpp_c_string(get_type_name(return_type_pointer)) };
+            let mut iflags = 0u32;
+            let flags = get_flags(method_info, &mut iflags);
+            let method_pointer = if is_readable_range(method_info as usize, std::mem::size_of::<usize>()) {
+                std::ptr::read_unaligned::<usize>(method_info as *const usize)
+            } else { 0 };
+            entries.push(MethodIndexEntry {
+                method_info: method_info as usize,
+                method_pointer,
+                namespace,
+                declaring_type,
+                method_name: il2cpp_c_string(get_method_name(method_info)),
+                return_type,
+                parameter_names,
+                parameter_types,
+                flags,
+            });
+        }
+    }
+    entries.sort_by(|left, right| left.method_pointer.cmp(&right.method_pointer).then(left.method_info.cmp(&right.method_info)));
+    Ok(entries)
+}
+
+unsafe fn ensure_method_index() -> Result<(), String> {
+    let generation;
+    {
+        let mut state = METHOD_INDEX.lock().unwrap_or_else(|error| error.into_inner());
+        match state.status {
+            "ready" => return Ok(()),
+            "building" => return Err("method_index_building".to_string()),
+            "failed" => return Err(if state.error.is_empty() { "method_index_failed".to_string() } else { state.error.clone() }),
+            _ => {}
+        }
+        state.generation = state.generation.saturating_add(1);
+        generation = state.generation;
+        state.status = "building";
+        state.error.clear();
+        state.entries.clear();
+        state.image_class_count = 0;
+        state.indexed_class_count = 0;
+        state.indexed_method_count = 0;
+        state.started_at_ms = method_index_now_ms();
+        state.heartbeat_at_ms = state.started_at_ms;
+        state.worker_active = true;
+    }
+    let spawn = std::thread::Builder::new()
+        .name(format!("hlpatch-method-index-{}", generation))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                build_method_index(generation)
+            })).map_err(|_| "method_index_worker_panic".to_string()).and_then(|value| value);
+            let mut state = METHOD_INDEX.lock().unwrap_or_else(|error| error.into_inner());
+            if state.generation != generation { return; }
+            state.worker_active = false;
+            state.heartbeat_at_ms = method_index_now_ms();
+            match result {
+                Ok(entries) => {
+                    let null_count = entries.iter().filter(|entry| entry.method_pointer == 0).count();
+                    let mut duplicate_count = 0usize;
+                    let mut previous = 0usize;
+                    for entry in entries.iter().filter(|entry| entry.method_pointer != 0) {
+                        if entry.method_pointer == previous { duplicate_count += 1; }
+                        previous = entry.method_pointer;
+                    }
+                    state.indexed_class_count = state.image_class_count;
+                    state.indexed_method_count = entries.len();
+                    state.null_method_pointer_count = null_count;
+                    state.duplicate_method_pointer_count = duplicate_count;
+                    state.entries = entries;
+                    state.error.clear();
+                    state.status = "ready";
+                }
+                Err(error) => {
+                    state.status = "failed";
+                    state.error = error;
+                }
+            }
+        });
+    if let Err(error) = spawn {
+        let mut state = METHOD_INDEX.lock().unwrap_or_else(|poison| poison.into_inner());
+        if state.generation == generation {
+            state.worker_active = false;
+            state.status = "failed";
+            state.error = format!("method_index_spawn_failed:{}", error);
+        }
+        return Err("method_index_spawn_failed".to_string());
+    }
+    let watchdog_generation = generation;
+    let watchdog = std::thread::Builder::new()
+        .name(format!("hlpatch-method-index-watchdog-{}", watchdog_generation))
+        .spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(181));
+            let mut state = METHOD_INDEX.lock().unwrap_or_else(|error| error.into_inner());
+            if state.generation == watchdog_generation && state.status == "building" {
+                state.generation = state.generation.saturating_add(1);
+                state.worker_active = false;
+                state.status = "failed";
+                state.error = "method_index_watchdog_timeout".to_string();
+                state.heartbeat_at_ms = method_index_now_ms();
+            }
+        });
+    if let Err(error) = watchdog {
+        let mut state = METHOD_INDEX.lock().unwrap_or_else(|poison| poison.into_inner());
+        if state.generation == generation {
+            state.generation = state.generation.saturating_add(1);
+            state.worker_active = false;
+            state.status = "failed";
+            state.error = format!("method_index_watchdog_spawn_failed:{}", error);
+        }
+        return Err("method_index_watchdog_spawn_failed".to_string());
+    }
+    Err("method_index_building".to_string())
+}
+
+fn method_index_status_endpoint(uri: &str) -> String {
+    let retry = parse_query_pairs(uri).ok().map(|pairs| query_pair(&pairs, "retry") == "1").unwrap_or(false);
+    if retry {
+        let mut state = METHOD_INDEX.lock().unwrap_or_else(|error| error.into_inner());
+        if state.status == "failed" && !state.worker_active {
+            state.status = "empty";
+            state.error.clear();
+        }
+    }
+    if retry { let _ = unsafe { ensure_method_index() }; }
+    let state = METHOD_INDEX.lock().unwrap_or_else(|error| error.into_inner());
+    let now = method_index_now_ms();
+    format!(r#"{{"ok":true,"status":"{}","generation":{},"worker_active":{},"started_at_ms":{},"heartbeat_at_ms":{},"heartbeat_age_ms":{},"classes_total":{},"classes_indexed":{},"methods_indexed":{},"error":{}}}"#,
+        state.status, state.generation, state.worker_active, state.started_at_ms, state.heartbeat_at_ms,
+        now.saturating_sub(state.heartbeat_at_ms), state.image_class_count, state.indexed_class_count,
+        state.indexed_method_count, if state.error.is_empty() { "null".to_string() } else { format!("\"{}\"", json_escape(&state.error)) })
+}
+
+fn method_entry_json(entry: &MethodIndexEntry, upper_bound: Option<usize>) -> String {
+    let parameters = entry.parameter_types.iter().enumerate().map(|(index, parameter_type)| {
+        let name = entry.parameter_names.get(index).and_then(|value| value.as_ref())
+            .map(|value| format!("\"{}\"", json_escape(value))).unwrap_or_else(|| "null".to_string());
+        format!(r#"{{"index":{},"name":{},"type":"{}"}}"#, index, name, json_escape(parameter_type))
+    }).collect::<Vec<_>>().join(",");
+    let upper = upper_bound.map(|value| format!("\"0x{:x}\"", value)).unwrap_or_else(|| "null".to_string());
+    format!(r#"{{"method_info":"0x{:x}","method_pointer":"0x{:x}","namespace":"{}","declaring_type":"{}","method":"{}","return_type":"{}","parameters":[{}],"flags":{},"static":{},"next_distinct_pointer_upper_bound":{},"boundary_kind":"upper_bound_estimate"}}"#,
+        entry.method_info, entry.method_pointer, json_escape(&entry.namespace), json_escape(&entry.declaring_type),
+        json_escape(&entry.method_name), json_escape(&entry.return_type), parameters, entry.flags,
+        (entry.flags & 0x0010) != 0, upper)
+}
+
+unsafe fn il2cpp_method_by_addr(uri: &str) -> String {
+    let pairs = match parse_query_pairs(uri) { Ok(value) => value, Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)) };
+    let raw = query_pair(&pairs, "addr");
+    let address = match parse_address(&raw) { Some(value) if value != 0 => value, _ => return r#"{"ok":false,"error":"invalid_or_missing_addr"}"#.to_string() };
+    if let Err(error) = ensure_method_index() { return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)); }
+    let state = match METHOD_INDEX.lock() { Ok(value) => value, Err(_) => return r#"{"ok":false,"error":"method_index_lock_poisoned"}"#.to_string() };
+    let method_info_matches: Vec<&MethodIndexEntry> = state.entries.iter().filter(|entry| entry.method_info == address).collect();
+    let exact_pointer_matches: Vec<&MethodIndexEntry> = state.entries.iter().filter(|entry| entry.method_pointer == address && entry.method_pointer != 0).collect();
+    let (kind, matches): (&str, Vec<&MethodIndexEntry>) = if !method_info_matches.is_empty() {
+        (if method_info_matches.len() == 1 { "exact_method_info" } else { "ambiguous" }, method_info_matches)
+    } else if !exact_pointer_matches.is_empty() {
+        (if exact_pointer_matches.len() == 1 { "exact_method_pointer" } else { "ambiguous" }, exact_pointer_matches)
+    } else {
+        let mut distinct: Vec<usize> = state.entries.iter().map(|entry| entry.method_pointer).filter(|value| *value != 0).collect();
+        distinct.dedup();
+        match distinct.binary_search(&address) {
+            Ok(_) => ("none", Vec::new()),
+            Err(position) if position > 0 && position < distinct.len() => {
+                let start = distinct[position - 1];
+                let candidates: Vec<&MethodIndexEntry> = state.entries.iter().filter(|entry| entry.method_pointer == start).collect();
+                (if candidates.len() == 1 { "upper_bound_candidate" } else { "ambiguous" }, candidates)
+            }
+            _ => ("none", Vec::new()),
+        }
+    };
+    let items = matches.iter().map(|entry| {
+        let upper = state.entries.iter().map(|candidate| candidate.method_pointer).filter(|pointer| *pointer > entry.method_pointer).min();
+        method_entry_json(entry, upper)
+    }).collect::<Vec<_>>().join(",");
+    format!(r#"{{"ok":true,"query":"0x{:x}","status":"{}","ambiguous":{},"matches":[{}],"index":{{"status":"{}","classes":{},"methods":{},"null_method_pointers":{},"duplicate_method_pointers":{}}}}}"#,
+        address, kind, kind == "ambiguous", items, state.status, state.indexed_class_count,
+        state.indexed_method_count, state.null_method_pointer_count, state.duplicate_method_pointer_count)
+}
+
+unsafe fn il2cpp_method_detail(uri: &str) -> String {
+    let pairs = match parse_query_pairs(uri) { Ok(value) => value, Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)) };
+    let namespace = query_pair(&pairs, "namespace");
+    let declaring_type = query_pair(&pairs, "declaring_type");
+    let method = query_pair(&pairs, "method");
+    let parameter_text = query_pair(&pairs, "parameter_types");
+    if declaring_type.is_empty() || method.is_empty() { return r#"{"ok":false,"error":"missing_declaring_type_or_method"}"#.to_string(); }
+    let parameter_types: Vec<String> = if parameter_text.is_empty() { Vec::new() } else { parameter_text.split(',').map(|value| value.trim().to_string()).collect() };
+    if let Err(error) = ensure_method_index() { return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)); }
+    let state = match METHOD_INDEX.lock() { Ok(value) => value, Err(_) => return r#"{"ok":false,"error":"method_index_lock_poisoned"}"#.to_string() };
+    let matches: Vec<&MethodIndexEntry> = state.entries.iter().filter(|entry| {
+        (namespace.is_empty() || entry.namespace == namespace) && entry.declaring_type == declaring_type &&
+        entry.method_name == method && entry.parameter_types == parameter_types
+    }).collect();
+    let status = if matches.is_empty() { "none" } else if matches.len() == 1 { "exact" } else { "ambiguous" };
+    let items = matches.iter().map(|entry| {
+        let upper = state.entries.iter().map(|candidate| candidate.method_pointer).filter(|pointer| *pointer > entry.method_pointer).min();
+        method_entry_json(entry, upper)
+    }).collect::<Vec<_>>().join(",");
+    format!(r#"{{"ok":true,"status":"{}","ambiguous":{},"matches":[{}]}}"#, status, status == "ambiguous", items)
+}
+
+unsafe fn il2cpp_nested_types(uri: &str) -> String {
+    let pairs = match parse_query_pairs(uri) { Ok(value) => value, Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)) };
+    let requested = query_pair(&pairs, "type");
+    if requested.is_empty() { return r#"{"ok":false,"error":"missing_type"}"#.to_string(); }
+    let class = find_class_by_full_declaring_name(&requested);
+    if class.is_null() { return format!(r#"{{"ok":false,"error":"class_not_found_or_ambiguous","type":"{}"}}"#, json_escape(&requested)); }
+    let nested_ptr = resolve_il2cpp_symbol("il2cpp_class_get_nested_types");
+    if nested_ptr.is_null() { return r#"{"ok":false,"error":"il2cpp_class_get_nested_types_unavailable"}"#.to_string(); }
+    let get_nested: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> *mut c_void = std::mem::transmute(nested_ptr);
+    let mut iterator = ptr::null_mut();
+    let mut items = Vec::new();
+    loop {
+        let nested = get_nested(class, &mut iterator);
+        if nested.is_null() { break; }
+        items.push(format!(r#"{{"type":"{}","class_pointer":"0x{:x}"}}"#, json_escape(&class_full_declaring_name(nested)), nested as usize));
+    }
+    format!(r#"{{"ok":true,"requested":"{}","direct_only":true,"count":{},"nested_types":[{}]}}"#, json_escape(&requested), items.len(), items.join(","))
+}
+
+unsafe fn il2cpp_enum_values_capability(uri: &str) -> String {
+    let pairs = match parse_query_pairs(uri) { Ok(value) => value, Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)) };
+    let requested = query_pair(&pairs, "type");
+    if requested.is_empty() { return r#"{\"ok\":false,\"error\":\"missing_type\"}"#.to_string(); }
+    let required = ["il2cpp_class_get_fields", "il2cpp_field_get_flags", "il2cpp_field_static_get_value"];
+    let available: Vec<bool> = required.iter().map(|name| !resolve_il2cpp_symbol(name).is_null()).collect();
+    format!(r#"{{"ok":true,"requested":"{}","value_status":"unresolved","integer_values":null,"declaration_order_inference":false,"runtime_api":{{"il2cpp_class_get_fields":{},"il2cpp_field_get_flags":{},"il2cpp_field_static_get_value":{}}}}}"#,
+        json_escape(&requested), available[0], available[1], available[2])
+}
+
+// ===== Unified observation persistent storage B-stage =====
+static STORAGE_SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
+static STORAGE_LAST_FLUSH_MS: AtomicU64 = AtomicU64::new(0);
+static STORAGE_LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+fn storage_set_error(error: &str) {
+    if let Ok(mut value) = STORAGE_LAST_ERROR.lock() {
+        *value = Some(error.to_string());
+    }
+}
+
+fn storage_clear_error() {
+    if let Ok(mut value) = STORAGE_LAST_ERROR.lock() { *value = None; }
+}
+
+
+// 全局观测记录先追加到当前会话的NDJSON，再允许调用方更新内存索引。
+// 每行以换行符作为完整提交边界；读取方不得把无换行的尾部当作完整记录。
+static GLOBAL_OBSERVATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_OBSERVATION_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn append_global_observation(
+    observation_type: &str,
+    completeness: &str,
+    payload_json: &str,
+    critical: bool,
+) -> Result<(String, u64, u64), String> {
+    let _write_guard = GLOBAL_OBSERVATION_WRITE_LOCK
+        .lock().map_err(|_| "global_observation_write_lock_poisoned".to_string())?;
+    let session_id = ensure_observation_session()?;
+    let sequence = GLOBAL_OBSERVATION_SEQUENCE.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+    let timestamp_ms = sniff_timestamp_ms();
+    let session_directory = observation_storage_root().join("sessions").join(&session_id);
+    std::fs::create_dir_all(&session_directory)
+        .map_err(|error| format!("create_global_observation_dir:{}", error))?;
+    let journal_path = session_directory.join("timeline.ndjson");
+    let line = format!(
+        r#"{{"session_id":"{}","sequence":{},"timestamp_ms":{},"type":"{}","completeness":"{}","payload":{}}}\n"#,
+        json_escape(&session_id), sequence, timestamp_ms, json_escape(observation_type),
+        json_escape(completeness), payload_json
+    );
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&journal_path)
+        .map_err(|error| format!("open_global_observation_journal:{}", error))?;
+    std::io::Write::write_all(&mut file, line.as_bytes())
+        .map_err(|error| format!("append_global_observation:{}", error))?;
+    if critical {
+        file.sync_data().map_err(|error| format!("sync_global_observation:{}", error))?;
+    }
+    let byte_length = file.metadata().map_err(|error| format!("stat_global_observation:{}", error))?.len();
+    drop(file);
+    let connection = open_observation_storage()?;
+    connection.execute(
+        "INSERT OR REPLACE INTO observation_files(
+             session_id, relative_path, content_type, byte_length, sha256, created_at_ms
+         ) VALUES(?1, 'timeline.ndjson', 'application/x-ndjson', ?2, NULL, ?3)",
+        rusqlite::params![session_id, byte_length as i64, timestamp_ms as i64],
+    ).map_err(|error| format!("index_global_observation:{}", error))?;
+    STORAGE_LAST_FLUSH_MS.store(timestamp_ms, Ordering::Release);
+    storage_clear_error();
+    Ok((session_id, sequence, timestamp_ms))
+}
+
+// ===== Protocol multi-section event timeline O-stage =====
+#[derive(Default)]
+struct ProtocolSectionScan {
+    turn_panel_paths: Vec<String>,
+    event_paths: Vec<String>,
+    choice_prompt_paths: Vec<String>,
+    choice_result_paths: Vec<String>,
+    training_paths: Vec<String>,
+    choice_index: Option<i64>,
+    story_id: Option<i64>,
+    event_id: Option<i64>,
+    decode_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct PendingProtocolChoice {
+    request_id: u64,
+    choice_index: i64,
+    story_id: Option<i64>,
+    event_id: Option<i64>,
+    submitted_at_ms: u64,
+}
+
+static PROTOCOL_PENDING_CHOICE: Mutex<Option<PendingProtocolChoice>> = Mutex::new(None);
+
+fn msgpack_read_u16(data: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes([*data.get(offset)?, *data.get(offset + 1)?]))
+}
+fn msgpack_read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_be_bytes([
+        *data.get(offset)?, *data.get(offset + 1)?, *data.get(offset + 2)?, *data.get(offset + 3)?,
+    ]))
+}
+fn msgpack_read_u64(data: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_be_bytes([
+        *data.get(offset)?, *data.get(offset + 1)?, *data.get(offset + 2)?, *data.get(offset + 3)?,
+        *data.get(offset + 4)?, *data.get(offset + 5)?, *data.get(offset + 6)?, *data.get(offset + 7)?,
+    ]))
+}
+
+fn msgpack_string_at(data: &[u8], offset: &mut usize) -> Result<Option<String>, String> {
+    let marker = *data.get(*offset).ok_or_else(|| "unexpected_eof_string_marker".to_string())?;
+    *offset += 1;
+    let length = match marker {
+        0xa0..=0xbf => usize::from(marker & 0x1f),
+        0xd9 => { let value = *data.get(*offset).ok_or_else(|| "unexpected_eof_str8".to_string())?; *offset += 1; usize::from(value) },
+        0xda => { let value = msgpack_read_u16(data, *offset).ok_or_else(|| "unexpected_eof_str16".to_string())?; *offset += 2; usize::from(value) },
+        0xdb => { let value = msgpack_read_u32(data, *offset).ok_or_else(|| "unexpected_eof_str32".to_string())?; *offset += 4; value as usize },
+        _ => { *offset -= 1; return Ok(None); }
+    };
+    let end = offset.checked_add(length).ok_or_else(|| "string_length_overflow".to_string())?;
+    let bytes = data.get(*offset..end).ok_or_else(|| "unexpected_eof_string_data".to_string())?;
+    *offset = end;
+    Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+}
+
+fn protocol_classify_key(scan: &mut ProtocolSectionScan, path: &str, key: &str, integer: Option<i64>) {
+    let lower = key.to_ascii_lowercase();
+    let full_path = if path.is_empty() { key.to_string() } else { format!("{}.{}", path, key) };
+    let push_once = |list: &mut Vec<String>, value: &str| {
+        if !list.iter().any(|item| item == value) { list.push(value.to_string()); }
+    };
+    if lower == "choice_index" || lower == "select_index" || lower == "selected_index" {
+        if let Some(value) = integer { scan.choice_index = Some(value); }
+    }
+    if lower == "story_id" { if let Some(value) = integer { scan.story_id = Some(value); } }
+    if lower == "event_id" { if let Some(value) = integer { scan.event_id = Some(value); } }
+
+    if lower.contains("home_info") || lower.contains("command_info") || lower == "turn" || lower.ends_with("_turn") {
+        push_once(&mut scan.turn_panel_paths, &full_path);
+    }
+    if lower.contains("training") || lower.contains("command_info") {
+        push_once(&mut scan.training_paths, &full_path);
+    }
+    if lower.contains("choice_result") || lower.contains("event_result") || lower.contains("select_result") {
+        push_once(&mut scan.choice_result_paths, &full_path);
+    }
+    if lower.contains("choice") && !lower.contains("result") && lower != "choice_index" {
+        push_once(&mut scan.choice_prompt_paths, &full_path);
+    }
+    if (lower.contains("event") || lower.contains("story")) && !lower.contains("result") {
+        push_once(&mut scan.event_paths, &full_path);
+    }
+}
+
+fn msgpack_walk_value(
+    data: &[u8], offset: &mut usize, path: &str, scan: &mut ProtocolSectionScan, depth: usize,
+) -> Result<Option<i64>, String> {
+    if depth > 512 { return Err("msgpack_nesting_exceeds_512".to_string()); }
+    let marker = *data.get(*offset).ok_or_else(|| "unexpected_eof_value".to_string())?;
+    if marker <= 0x7f { *offset += 1; return Ok(Some(i64::from(marker))); }
+    if marker >= 0xe0 { *offset += 1; return Ok(Some(i64::from(marker as i8))); }
+    if matches!(marker, 0xa0..=0xbf | 0xd9 | 0xda | 0xdb) {
+        let _ = msgpack_string_at(data, offset)?;
+        return Ok(None);
+    }
+    *offset += 1;
+    match marker {
+        0x80..=0x8f => {
+            let count = usize::from(marker & 0x0f);
+            msgpack_walk_map(data, offset, path, scan, depth + 1, count)?;
+        }
+        0x90..=0x9f => {
+            let count = usize::from(marker & 0x0f);
+            for index in 0..count {
+                let child = format!("{}[{}]", path, index);
+                msgpack_walk_value(data, offset, &child, scan, depth + 1)?;
+            }
+        }
+        0xc0 | 0xc2 | 0xc3 => {}
+        0xc4 => { let n = usize::from(*data.get(*offset).ok_or_else(|| "unexpected_eof_bin8".to_string())?); *offset += 1; *offset = offset.checked_add(n).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_bin8_data".to_string())?; }
+        0xc5 => { let n = usize::from(msgpack_read_u16(data, *offset).ok_or_else(|| "unexpected_eof_bin16".to_string())?); *offset += 2; *offset = offset.checked_add(n).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_bin16_data".to_string())?; }
+        0xc6 => { let n = msgpack_read_u32(data, *offset).ok_or_else(|| "unexpected_eof_bin32".to_string())? as usize; *offset += 4; *offset = offset.checked_add(n).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_bin32_data".to_string())?; }
+        0xca => { *offset = offset.checked_add(4).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_float32".to_string())?; }
+        0xcb => { *offset = offset.checked_add(8).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_float64".to_string())?; }
+        0xcc => { let value = *data.get(*offset).ok_or_else(|| "unexpected_eof_uint8".to_string())?; *offset += 1; return Ok(Some(i64::from(value))); }
+        0xcd => { let value = msgpack_read_u16(data, *offset).ok_or_else(|| "unexpected_eof_uint16".to_string())?; *offset += 2; return Ok(Some(i64::from(value))); }
+        0xce => { let value = msgpack_read_u32(data, *offset).ok_or_else(|| "unexpected_eof_uint32".to_string())?; *offset += 4; return Ok(Some(i64::from(value))); }
+        0xcf => { let value = msgpack_read_u64(data, *offset).ok_or_else(|| "unexpected_eof_uint64".to_string())?; *offset += 8; return Ok(i64::try_from(value).ok()); }
+        0xd0 => { let value = *data.get(*offset).ok_or_else(|| "unexpected_eof_int8".to_string())? as i8; *offset += 1; return Ok(Some(i64::from(value))); }
+        0xd1 => { let value = msgpack_read_u16(data, *offset).ok_or_else(|| "unexpected_eof_int16".to_string())? as i16; *offset += 2; return Ok(Some(i64::from(value))); }
+        0xd2 => { let value = msgpack_read_u32(data, *offset).ok_or_else(|| "unexpected_eof_int32".to_string())? as i32; *offset += 4; return Ok(Some(i64::from(value))); }
+        0xd3 => { let value = msgpack_read_u64(data, *offset).ok_or_else(|| "unexpected_eof_int64".to_string())? as i64; *offset += 8; return Ok(Some(value)); }
+        0xdc => { let count = usize::from(msgpack_read_u16(data, *offset).ok_or_else(|| "unexpected_eof_array16".to_string())?); *offset += 2; for index in 0..count { let child = format!("{}[{}]", path, index); msgpack_walk_value(data, offset, &child, scan, depth + 1)?; } }
+        0xdd => { let count = msgpack_read_u32(data, *offset).ok_or_else(|| "unexpected_eof_array32".to_string())? as usize; *offset += 4; for index in 0..count { let child = format!("{}[{}]", path, index); msgpack_walk_value(data, offset, &child, scan, depth + 1)?; } }
+        0xde => { let count = usize::from(msgpack_read_u16(data, *offset).ok_or_else(|| "unexpected_eof_map16".to_string())?); *offset += 2; msgpack_walk_map(data, offset, path, scan, depth + 1, count)?; }
+        0xdf => { let count = msgpack_read_u32(data, *offset).ok_or_else(|| "unexpected_eof_map32".to_string())? as usize; *offset += 4; msgpack_walk_map(data, offset, path, scan, depth + 1, count)?; }
+        0xd4 => { *offset = offset.checked_add(2).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_fixext1".to_string())?; }
+        0xd5 => { *offset = offset.checked_add(3).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_fixext2".to_string())?; }
+        0xd6 => { *offset = offset.checked_add(5).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_fixext4".to_string())?; }
+        0xd7 => { *offset = offset.checked_add(9).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_fixext8".to_string())?; }
+        0xd8 => { *offset = offset.checked_add(17).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_fixext16".to_string())?; }
+        0xc7 => { let n = usize::from(*data.get(*offset).ok_or_else(|| "unexpected_eof_ext8".to_string())?); *offset += 1; *offset = offset.checked_add(n + 1).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_ext8_data".to_string())?; }
+        0xc8 => { let n = usize::from(msgpack_read_u16(data, *offset).ok_or_else(|| "unexpected_eof_ext16".to_string())?); *offset += 2; *offset = offset.checked_add(n + 1).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_ext16_data".to_string())?; }
+        0xc9 => { let n = msgpack_read_u32(data, *offset).ok_or_else(|| "unexpected_eof_ext32".to_string())? as usize; *offset += 4; *offset = offset.checked_add(n + 1).filter(|end| *end <= data.len()).ok_or_else(|| "unexpected_eof_ext32_data".to_string())?; }
+        0xc1 => return Err("reserved_msgpack_marker_c1".to_string()),
+        _ => return Err(format!("unsupported_msgpack_marker_{:02x}", marker)),
+    }
+    Ok(None)
+}
+
+fn msgpack_walk_map(
+    data: &[u8], offset: &mut usize, path: &str, scan: &mut ProtocolSectionScan, depth: usize, count: usize,
+) -> Result<(), String> {
+    for _ in 0..count {
+        let key_start = *offset;
+        let key = match msgpack_string_at(data, offset)? {
+            Some(value) => value,
+            None => {
+                *offset = key_start;
+                msgpack_walk_value(data, offset, path, scan, depth + 1)?;
+                format!("<non_string_key@{}>", key_start)
+            }
+        };
+        let child_path = if path.is_empty() { key.clone() } else { format!("{}.{}", path, key) };
+        let integer = msgpack_walk_value(data, offset, &child_path, scan, depth + 1)?;
+        protocol_classify_key(scan, path, &key, integer);
+    }
+    Ok(())
+}
+
+fn scan_protocol_sections(payload: &[u8]) -> ProtocolSectionScan {
+    let mut scan = ProtocolSectionScan::default();
+    let mut offset = 0usize;
+    if let Err(error) = msgpack_walk_value(payload, &mut offset, "", &mut scan, 0) {
+        scan.decode_error = Some(format!("{}@{}", error, offset));
+    } else if offset != payload.len() {
+        scan.decode_error = Some(format!("trailing_bytes:{}", payload.len() - offset));
+    }
+    scan
+}
+
+fn string_array_json(values: &[String]) -> String {
+    values.iter().map(|value| format!("\"{}\"", json_escape(value))).collect::<Vec<_>>().join(",")
+}
+
+fn optional_i64_json(value: Option<i64>) -> String {
+    value.map(|item| item.to_string()).unwrap_or_else(|| "null".to_string())
+}
+
+fn persist_protocol_semantic_timeline(
+    direction: &str, request_id: u64, url: &str, relative_base: &str, payload: &[u8],
+) -> Result<(), String> {
+    let scan = scan_protocol_sections(payload);
+    let mut visibility = "not_applicable";
+    let mut linked_request_id = None;
+    let mut linked_choice_index = None;
+
+    if direction == "request" {
+        if let Some(choice_index) = scan.choice_index {
+            let pending = PendingProtocolChoice {
+                request_id, choice_index, story_id: scan.story_id, event_id: scan.event_id,
+                submitted_at_ms: sniff_timestamp_ms(),
+            };
+            let mut state = PROTOCOL_PENDING_CHOICE.lock()
+                .map_err(|_| "pending_protocol_choice_lock_poisoned".to_string())?;
+            *state = Some(pending);
+            visibility = "choice_submitted";
+        }
+    } else if direction == "response" && !scan.choice_result_paths.is_empty() {
+        let pending = PROTOCOL_PENDING_CHOICE.lock()
+            .map_err(|_| "pending_protocol_choice_lock_poisoned".to_string())?.take();
+        if let Some(choice) = pending {
+            visibility = "post_choice_pre_ui";
+            linked_request_id = Some(choice.request_id);
+            linked_choice_index = Some(choice.choice_index);
+        } else {
+            visibility = "received_without_observed_choice_request";
+        }
+    }
+
+    let decode_error = scan.decode_error.as_ref()
+        .map(|value| format!("\"{}\"", json_escape(value))).unwrap_or_else(|| "null".to_string());
+    let payload_json = format!(
+        r#"{{"direction":"{}","request_id":{},"url":"{}","relative_base":"{}","payload_length":{},"decoder":"messagepack_recursive","decode_error":{},"sections":{{"turn_panel":{{"present":{},"paths":[{}]}},"event_declaration":{{"present":{},"paths":[{}]}},"choice_prompt":{{"present":{},"paths":[{}]}},"choice_result":{{"present":{},"paths":[{}]}},"training_home_info":{{"present":{},"paths":[{}]}}}},"choice_index":{},"story_id":{},"event_id":{},"linked_choice_request_id":{},"linked_choice_index":{},"visibility":"{}","all_sections_are_nonexclusive":true}}"#,
+        json_escape(direction), request_id, json_escape(url), json_escape(relative_base), payload.len(), decode_error,
+        !scan.turn_panel_paths.is_empty(), string_array_json(&scan.turn_panel_paths),
+        !scan.event_paths.is_empty(), string_array_json(&scan.event_paths),
+        !scan.choice_prompt_paths.is_empty(), string_array_json(&scan.choice_prompt_paths),
+        !scan.choice_result_paths.is_empty(), string_array_json(&scan.choice_result_paths),
+        !scan.training_paths.is_empty(), string_array_json(&scan.training_paths),
+        optional_i64_json(scan.choice_index), optional_i64_json(scan.story_id), optional_i64_json(scan.event_id),
+        optional_i64_json(linked_request_id.map(|value| value as i64)), optional_i64_json(linked_choice_index),
+        visibility
+    );
+    append_global_observation("protocol_multisection", "complete", &payload_json, true).map(|_| ())
+}
+
+fn persist_protocol_observation_boundary(
+    direction: &str,
+    request_id: u64,
+    url: &str,
+    relative_base: &str,
+    headers_length: usize,
+    payload_length: usize,
+) -> Result<(), String> {
+    let payload = format!(
+        r#"{{"direction":"{}","request_id":{},"url":"{}","relative_base":"{}","headers_length":{},"payload_length":{}}}"#,
+        json_escape(direction), request_id, json_escape(url), json_escape(relative_base),
+        headers_length, payload_length
+    );
+    append_global_observation("protocol_exchange_part", "complete", &payload, true).map(|_| ())
+}
+
+fn persist_protocol_capture(direction: &str, request_id: u64, url: &str, headers: &[u8], payload: &[u8]) -> Result<(), String> {
+    let session_id = ensure_observation_session()?;
+    let now = sniff_timestamp_ms();
+    let suffix = if direction == "response" { format!("{}-{}", request_id, now) } else { request_id.to_string() };
+    let relative_base = format!("protocol/{}/{}", direction, suffix);
+    let session_dir = observation_storage_root().join("sessions").join(&session_id);
+    let target_dir = session_dir.join(&relative_base);
+    std::fs::create_dir_all(&target_dir).map_err(|error| format!("create_protocol_dir:{}", error))?;
+    let files: [(&str, &[u8], &str); 3] = [
+        ("url.txt", url.as_bytes(), "text/plain; charset=utf-8"),
+        ("headers.raw", headers, "application/octet-stream"),
+        ("payload.bin", payload, "application/octet-stream"),
+    ];
+    for (name, bytes, _) in &files {
+        let temporary = target_dir.join(format!("{}.tmp", name));
+        let mut file = std::fs::File::create(&temporary)
+            .map_err(|error| format!("create_protocol_file:{}:{}", name, error))?;
+        std::io::Write::write_all(&mut file, bytes)
+            .map_err(|error| format!("write_protocol_file:{}:{}", name, error))?;
+        file.sync_data().map_err(|error| format!("sync_protocol_file:{}:{}", name, error))?;
+        drop(file);
+        std::fs::rename(&temporary, target_dir.join(name))
+            .map_err(|error| format!("commit_protocol_file:{}:{}", name, error))?;
+    }
+    let mut connection = open_observation_storage()?;
+    let transaction = connection.transaction().map_err(|error| format!("protocol_index_transaction:{}", error))?;
+    for (name, bytes, content_type) in &files {
+        let relative = format!("{}/{}", relative_base, name);
+        transaction.execute(
+            "INSERT OR REPLACE INTO observation_files(session_id, relative_path, content_type, byte_length, sha256, created_at_ms) VALUES(?1, ?2, ?3, ?4, NULL, ?5)",
+            rusqlite::params![session_id, relative, content_type, bytes.len() as i64, now as i64],
+        ).map_err(|error| format!("index_protocol_file:{}:{}", name, error))?;
+    }
+    transaction.commit().map_err(|error| format!("commit_protocol_index:{}", error))?;
+    persist_protocol_observation_boundary(
+        direction, request_id, url, &relative_base, headers.len(), payload.len()
+    )?;
+    persist_protocol_semantic_timeline(direction, request_id, url, &relative_base, payload)?;
+    storage_clear_error();
+    Ok(())
+}
+
+fn observation_storage_root() -> std::path::PathBuf {
+    if let Ok(command_line) = std::fs::read("/proc/self/cmdline") {
+        let package_bytes = command_line.split(|byte| *byte == 0).next().unwrap_or(&[]);
+        if let Ok(package_name) = std::str::from_utf8(package_bytes) {
+            if !package_name.is_empty() {
+                return std::path::PathBuf::from("/data/user/0")
+                    .join(package_name)
+                    .join("files")
+                    .join("hlpatch-observations");
+            }
+        }
+    }
+    std::path::PathBuf::from("/data/user/0/jp.co.cygames.umamusume/files/hlpatch-observations")
+}
+
+fn observation_storage_db_path() -> std::path::PathBuf {
+    observation_storage_root().join("index.sqlite")
+}
+
+fn open_observation_storage() -> Result<Connection, String> {
+    let root = observation_storage_root();
+    std::fs::create_dir_all(root.join("sessions")).map_err(|error| format!("create_sessions_dir:{}", error))?;
+    std::fs::create_dir_all(root.join("blobs")).map_err(|error| format!("create_blobs_dir:{}", error))?;
+    let db_path = observation_storage_db_path();
+    let connection = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    ).map_err(|error| format!("open_index:{}", error))?;
+    connection.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=FULL;
+         PRAGMA foreign_keys=ON;
+         CREATE TABLE IF NOT EXISTS storage_meta(
+             key TEXT PRIMARY KEY NOT NULL,
+             value TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS observation_sessions(
+             session_id TEXT PRIMARY KEY NOT NULL,
+             process_id INTEGER NOT NULL,
+             process_start_token TEXT NOT NULL DEFAULT '',
+             plugin_version TEXT NOT NULL,
+             started_at_ms INTEGER NOT NULL,
+             last_flush_ms INTEGER NOT NULL,
+             state TEXT NOT NULL,
+             recovered_after_restart INTEGER NOT NULL DEFAULT 0,
+             root_path TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS observation_files(
+             file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id TEXT NOT NULL,
+             relative_path TEXT NOT NULL,
+             content_type TEXT NOT NULL,
+             byte_length INTEGER NOT NULL,
+             sha256 TEXT,
+             created_at_ms INTEGER NOT NULL,
+             UNIQUE(session_id, relative_path),
+             FOREIGN KEY(session_id) REFERENCES observation_sessions(session_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_observation_files_session_id_file_id
+             ON observation_files(session_id, file_id);"
+    ).map_err(|error| format!("initialize_schema:{}", error))?;
+    let has_start_token = connection.prepare("PRAGMA table_info(observation_sessions)")
+        .and_then(|mut statement| statement.query_map([], |row| row.get::<_, String>(1))
+            .map(|rows| rows.filter_map(Result::ok).any(|name| name == "process_start_token")))
+        .unwrap_or(false);
+    if !has_start_token {
+        connection.execute("ALTER TABLE observation_sessions ADD COLUMN process_start_token TEXT NOT NULL DEFAULT ''", [])
+            .map_err(|error| format!("migrate_process_start_token:{}", error))?;
+    }
+    Ok(connection)
+}
+
+fn observation_process_start_token() -> String {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let start_ticks = stat.rsplit_once(')').map(|(_, tail)| tail.split_whitespace().nth(19).unwrap_or("")).unwrap_or("");
+    format!("{}:{}", std::process::id(), start_ticks)
+}
+
+fn ensure_observation_session() -> Result<String, String> {
+    if let Ok(value) = STORAGE_SESSION_ID.lock() {
+        if let Some(session_id) = value.as_ref() {
+            return Ok(session_id.clone());
+        }
+    }
+    let connection = open_observation_storage()?;
+    let now = sniff_timestamp_ms();
+    let process_id = std::process::id();
+    let process_start_token = observation_process_start_token();
+    let session_id = format!("{}-{}", now, process_id);
+    let root_text = observation_storage_root().to_string_lossy().into_owned();
+    connection.execute(
+        "UPDATE observation_sessions
+         SET state='interrupted', recovered_after_restart=1
+         WHERE state='open' AND process_start_token<>?1",
+        rusqlite::params![process_start_token],
+    ).map_err(|error| format!("recover_previous_sessions:{}", error))?;
+    connection.execute(
+        "INSERT INTO observation_sessions(
+             session_id, process_id, process_start_token, plugin_version, started_at_ms,
+             last_flush_ms, state, recovered_after_restart, root_path
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'open', 0, ?7)",
+        rusqlite::params![session_id, process_id as i64, process_start_token, PLUGIN_VERSION, now as i64, now as i64, root_text],
+    ).map_err(|error| format!("insert_session:{}", error))?;
+    let session_directory = observation_storage_root().join("sessions").join(&session_id);
+    if let Err(error) = std::fs::create_dir_all(&session_directory) {
+        let _ = connection.execute("DELETE FROM observation_sessions WHERE session_id=?1", rusqlite::params![session_id]);
+        return Err(format!("create_session_dir:{}", error));
+    }
+    let session_json = format!(
+        r#"{{"session_id":"{}","process_id":{},"plugin_version":"{}","started_at_ms":{},"state":"open","recovered_after_restart":false,"root_path":"{}"}}"#,
+        json_escape(&session_id), process_id, json_escape(PLUGIN_VERSION), now, json_escape(&root_text)
+    );
+    if let Err(error) = std::fs::write(session_directory.join("session.json"), session_json.as_bytes()) {
+        let _ = connection.execute("DELETE FROM observation_sessions WHERE session_id=?1", rusqlite::params![session_id]);
+        let _ = std::fs::remove_dir_all(&session_directory);
+        return Err(format!("write_session_json:{}", error));
+    }
+    if let Err(error) = connection.execute(
+        "INSERT OR REPLACE INTO observation_files(
+             session_id, relative_path, content_type, byte_length, sha256, created_at_ms
+         ) VALUES(?1, 'session.json', 'application/json', ?2, NULL, ?3)",
+        rusqlite::params![session_id, session_json.as_bytes().len() as i64, now as i64],
+    ) {
+        let _ = connection.execute("DELETE FROM observation_sessions WHERE session_id=?1", rusqlite::params![session_id]);
+        let _ = std::fs::remove_dir_all(&session_directory);
+        return Err(format!("index_session_json:{}", error));
+    }
+    STORAGE_LAST_FLUSH_MS.store(now, Ordering::Relaxed);
+    let mut state = STORAGE_SESSION_ID.lock().map_err(|_| "storage_session_lock_poisoned".to_string())?;
+    *state = Some(session_id.clone());
+    Ok(session_id)
+}
+
+fn storage_status_endpoint() -> String {
+    let root = observation_storage_root();
+    let db_path = observation_storage_db_path();
+    let session = ensure_observation_session();
+    if let Err(error) = session.as_ref() { storage_set_error(error); }
+    let current_session = session.ok();
+    let writable_probe_path = root.join(".write_probe");
+    let writable = std::fs::write(&writable_probe_path, b"hlpatch-storage-probe")
+        .and_then(|_| std::fs::remove_file(&writable_probe_path)).is_ok();
+    let error = STORAGE_LAST_ERROR.lock().ok().and_then(|value| value.clone());
+    let session_json = current_session.as_ref().map(|value| format!("\"{}\"", json_escape(value))).unwrap_or_else(|| "null".to_string());
+    let error_json = error.map(|value| format!("\"{}\"", json_escape(&value))).unwrap_or_else(|| "null".to_string());
+    format!(
+        r#"{{"ok":{},"schema_version":1,"root_path":"{}","index_path":"{}","writable":{},"current_session_id":{},"last_flush_ms":{},"last_error":{},"storage_format":{{"index":"sqlite","timeline":"ndjson","payloads":"raw_files"}}}}"#,
+        writable && current_session.is_some(), json_escape(&root.to_string_lossy()),
+        json_escape(&db_path.to_string_lossy()), writable, session_json,
+        STORAGE_LAST_FLUSH_MS.load(Ordering::Relaxed), error_json
+    )
+}
+
+fn storage_sessions_endpoint() -> String {
+    if let Err(error) = ensure_observation_session() {
+        storage_set_error(&error);
+        return format!(r#"{{"ok":false,"error":"{}","sessions":[]}}"#, json_escape(&error));
+    }
+    let connection = match open_observation_storage() {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"{}","sessions":[]}}"#, json_escape(&error)),
+    };
+    let mut statement = match connection.prepare(
+        "SELECT session_id, process_id, plugin_version, started_at_ms, last_flush_ms,
+                state, recovered_after_restart, root_path
+         FROM observation_sessions ORDER BY started_at_ms, session_id"
+    ) {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"prepare_sessions:{}","sessions":[]}}"#, json_escape(&error.to_string())),
+    };
+    let rows = match statement.query_map([], |row| {
+        Ok(format!(
+            r#"{{"session_id":"{}","process_id":{},"plugin_version":"{}","started_at_ms":{},"last_flush_ms":{},"state":"{}","recovered_after_restart":{},"root_path":"{}"}}"#,
+            json_escape(&row.get::<_, String>(0)?), row.get::<_, i64>(1)?,
+            json_escape(&row.get::<_, String>(2)?), row.get::<_, i64>(3)?, row.get::<_, i64>(4)?,
+            json_escape(&row.get::<_, String>(5)?), row.get::<_, i64>(6)? != 0,
+            json_escape(&row.get::<_, String>(7)?)
+        ))
+    }) {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"query_sessions:{}","sessions":[]}}"#, json_escape(&error.to_string())),
+    };
+    let mut sessions = Vec::new();
+    for row in rows {
+        match row {
+            Ok(value) => sessions.push(value),
+            Err(error) => {
+                let detail = format!("decode_session_row:{}", error);
+                storage_set_error(&detail);
+                return format!(r#"{{"ok":false,"error":"{}","sessions":[]}}"#, json_escape(&detail));
+            }
+        }
+    }
+    storage_clear_error();
+    format!(r#"{{"ok":true,"count":{},"sessions":[{}]}}"#, sessions.len(), sessions.join(","))
+}
+
+fn storage_session_endpoint(uri: &str) -> String {
+    let pairs = match parse_query_pairs(uri) {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)),
+    };
+    let session_id = query_pair(&pairs, "id");
+    if session_id.is_empty() { return r#"{"ok":false,"error":"missing_id"}"#.to_string(); }
+    let connection = match open_observation_storage() {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)),
+    };
+    let result = connection.query_row(
+        "SELECT process_id, plugin_version, started_at_ms, last_flush_ms,
+                state, recovered_after_restart, root_path
+         FROM observation_sessions WHERE session_id=?1",
+        rusqlite::params![session_id],
+        |row| Ok(format!(
+            r#"{{"ok":true,"session":{{"session_id":"{}","process_id":{},"plugin_version":"{}","started_at_ms":{},"last_flush_ms":{},"state":"{}","recovered_after_restart":{},"root_path":"{}"}}}}"#,
+            json_escape(&session_id), row.get::<_, i64>(0)?, json_escape(&row.get::<_, String>(1)?),
+            row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, json_escape(&row.get::<_, String>(4)?),
+            row.get::<_, i64>(5)? != 0, json_escape(&row.get::<_, String>(6)?)
+        )),
+    );
+    match result {
+        Ok(value) => value,
+        Err(rusqlite::Error::QueryReturnedNoRows) => r#"{"ok":true,"session":null,"status":"none"}"#.to_string(),
+        Err(error) => format!(r#"{{"ok":false,"error":"query_session:{}"}}"#, json_escape(&error.to_string())),
+    }
+}
+
+fn storage_flush_endpoint() -> String {
+    let session_id = match ensure_observation_session() {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)),
+    };
+    let connection = match open_observation_storage() {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)),
+    };
+    let now = sniff_timestamp_ms();
+    if let Err(error) = connection.execute_batch("PRAGMA wal_checkpoint(FULL);") {
+        let detail = format!("checkpoint:{}", error); storage_set_error(&detail);
+        return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&detail));
+    }
+    if let Err(error) = connection.execute(
+        "UPDATE observation_sessions SET last_flush_ms=?1 WHERE session_id=?2",
+        rusqlite::params![now as i64, session_id],
+    ) {
+        let detail = format!("update_flush:{}", error); storage_set_error(&detail);
+        return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&detail));
+    }
+    STORAGE_LAST_FLUSH_MS.store(now, Ordering::Relaxed);
+    storage_clear_error();
+    format!(r#"{{"ok":true,"session_id":"{}","last_flush_ms":{},"checkpoint":"full"}}"#, json_escape(&session_id), now)
+}
+
+fn storage_recover_endpoint() -> String {
+    let connection = match open_observation_storage() {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)),
+    };
+    let process_start_token = observation_process_start_token();
+    let recovered = match connection.execute(
+        "UPDATE observation_sessions
+         SET state='interrupted', recovered_after_restart=1
+         WHERE state='open' AND process_start_token<>?1",
+        rusqlite::params![process_start_token],
+    ) {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"recover:{}"}}"#, json_escape(&error.to_string())),
+    };
+    match ensure_observation_session() {
+        Ok(session_id) => format!(r#"{{"ok":true,"recovered_session_count":{},"current_session_id":"{}"}}"#, recovered, json_escape(&session_id)),
+        Err(error) => format!(r#"{{"ok":false,"error":"{}","recovered_session_count":{}}}"#, json_escape(&error), recovered),
+    }
+}
+
+// ===== Unified inheritance pair compatibility C-stage =====
+fn inherit_pair_compat_endpoint(uri: &str) -> String {
+    let pairs = match parse_query_pairs(uri) {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)),
+    };
+    if pairs.iter().filter(|(key, _)| key == "chara_id_a").count() != 1 || pairs.iter().filter(|(key, _)| key == "chara_id_b").count() != 1 { return r#"{\"ok\":false,\"error\":\"missing_or_duplicate_character_key\"}"#.to_string(); }
+    let chara_id_a = match query_pair(&pairs, "chara_id_a").parse::<i32>() {
+        Ok(value) if value > 0 => value,
+        _ => return r#"{"ok":false,"error":"invalid_or_missing_chara_id_a"}"#.to_string(),
+    };
+    let chara_id_b = match query_pair(&pairs, "chara_id_b").parse::<i32>() {
+        Ok(value) if value > 0 => value,
+        _ => return r#"{"ok":false,"error":"invalid_or_missing_chara_id_b"}"#.to_string(),
+    };
+    let mdb_path = match find_mdb_path() {
+        Some(value) => value,
+        None => return r#"{"ok":false,"error":"mdb_not_found"}"#.to_string(),
+    };
+    let connection = match Connection::open_with_flags(&mdb_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"mdb_open_failed","detail":"{}"}}"#, json_escape(&error.to_string())),
+    };
+    for (label, value) in [("chara_id_a", chara_id_a), ("chara_id_b", chara_id_b)] {
+        let exists = connection.query_row("SELECT EXISTS(SELECT 1 FROM chara_data WHERE id=?1)", rusqlite::params![value], |row| row.get::<_, i64>(0));
+        match exists { Ok(1) => {}, Ok(_) => return format!(r#"{{\"ok\":false,\"error\":\"character_not_found\",\"field\":\"{}\",\"value\":{}}}"#, label, value), Err(error) => return format!(r#"{{\"ok\":false,\"error\":\"character_validation_failed\",\"detail\":\"{}\"}}"#, json_escape(&error.to_string())) }
+    }
+    let mut statement = match connection.prepare(
+        "SELECT DISTINCT r.relation_type, r.relation_point
+         FROM succession_relation r
+         INNER JOIN succession_relation_member a
+             ON a.relation_type = r.relation_type AND a.chara_id = ?1
+         INNER JOIN succession_relation_member b
+             ON b.relation_type = r.relation_type AND b.chara_id = ?2
+         ORDER BY r.relation_type, r.relation_point"
+    ) {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"pair_query_prepare_failed","detail":"{}"}}"#, json_escape(&error.to_string())),
+    };
+    let mapped = match statement.query_map(rusqlite::params![chara_id_a, chara_id_b], |row| {
+        Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?))
+    }) {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"pair_query_failed","detail":"{}"}}"#, json_escape(&error.to_string())),
+    };
+    let mut relation_items = Vec::new();
+    let mut base_compatibility = 0i64;
+    for row in mapped {
+        let (relation_type, relation_point) = match row {
+            Ok(value) => value,
+            Err(error) => return format!(r#"{{"ok":false,"error":"pair_row_decode_failed","detail":"{}"}}"#, json_escape(&error.to_string())),
+        };
+        base_compatibility += i64::from(relation_point);
+        relation_items.push(format!(
+            r#"{{"relation_type":{},"relation_point":{},"chara_id_a_member":true,"chara_id_b_member":true}}"#,
+            relation_type, relation_point
+        ));
+    }
+    format!(
+        r#"{{"ok":true,"source":"current_mdb","calculation":"sum_shared_succession_relation_points","chara_id_a":{},"chara_id_b":{},"shared_relation_count":{},"base_compatibility":{},"shared_relations":[{}],"race_bonus":null,"specific_trained_chara_adjustments":null,"runtime_consumer_result":null,"scope":"character_pair_base_only"}}"#,
+        chara_id_a, chara_id_b, relation_items.len(), base_compatibility, relation_items.join(",")
+    )
+}
+
+// ===== Unified selected inheritance parents D-stage =====
+unsafe fn inherit_selected_parent_runtime_endpoint() -> String {
+    if API.is_null() {
+        return r#"{"ok":false,"error":"api_null"}"#.to_string();
+    }
+    let image = get_image();
+    if image.is_null() {
+        return r#"{"ok":false,"error":"image_null"}"#.to_string();
+    }
+    let wdm_class = find_class(
+        image,
+        to_cstr("Gallop").as_ptr(),
+        to_cstr("WorkDataManager").as_ptr(),
+    );
+    if wdm_class.is_null() {
+        return r#"{"ok":false,"error":"work_data_manager_class_not_found"}"#.to_string();
+    }
+    let wdm = get_singleton(wdm_class);
+    if wdm.is_null() {
+        return r#"{"ok":false,"error":"work_data_manager_instance_not_found"}"#.to_string();
+    }
+    let single_mode_class = find_class(
+        image,
+        to_cstr("Gallop").as_ptr(),
+        to_cstr("WorkSingleModeData").as_ptr(),
+    );
+    if single_mode_class.is_null() {
+        return r#"{"ok":false,"error":"work_single_mode_data_class_not_found"}"#.to_string();
+    }
+    let single_mode = call_getter_ref(wdm_class, wdm, "get_SingleMode");
+    if single_mode.is_null() {
+        return r#"{"ok":false,"error":"single_mode_instance_not_found"}"#.to_string();
+    }
+    let chara_class = find_class(
+        image,
+        to_cstr("Gallop").as_ptr(),
+        to_cstr("WorkSingleModeCharaData").as_ptr(),
+    );
+    if chara_class.is_null() {
+        return r#"{"ok":false,"error":"work_single_mode_chara_data_class_not_found"}"#.to_string();
+    }
+    let chara = call_getter_ref(single_mode_class, single_mode, "get_Character");
+    if chara.is_null() {
+        return r#"{"ok":false,"error":"single_mode_character_instance_not_found"}"#.to_string();
+    }
+    let succession_info_class = find_class_by_short_name(image, "SuccessionCharaInfo");
+    if succession_info_class.is_null() {
+        return r#"{"ok":false,"error":"succession_chara_info_class_not_found"}"#.to_string();
+    }
+
+    let target_card_id = call_getter_int(chara_class, chara, "get_CardId");
+    let target_chara_id = call_getter_int(chara_class, chara, "get_CharaId");
+    let first = call_getter_ref(
+        chara_class,
+        chara,
+        "get_SuccessionTrainedCharaInfoFirst",
+    );
+    let second = call_getter_ref(
+        chara_class,
+        chara,
+        "get_SuccessionTrainedCharaInfoSecond",
+    );
+
+    let render_slot = |slot: &str, info: *mut c_void| -> String {
+        if info.is_null() {
+            return format!(
+                r#"{{"slot":"{}","selected":false,"trained_chara_id":null,"trained_chara_record":null}}"#,
+                slot
+            );
+        }
+        let trained_chara_id = call_getter_obscured_int(
+            succession_info_class,
+            info,
+            "get_TrainedCharaId",
+        );
+        format!(
+            r#"{{"slot":"{}","selected":true,"trained_chara_id":{},"trained_chara_record":null}}"#,
+            slot, trained_chara_id
+        )
+    };
+
+    format!(
+        r#"{{"ok":true,"source":"current_work_single_mode_character","scope":"selected_parent_ids_only","target":{{"card_id":{},"chara_id":{}}},"parents":[{},{}],"trained_chara_record_resolution":null,"ancestor_tree":null,"pair_compatibility":null,"race_bonus":null,"runtime_consumer_result":null,"id_semantics":"trained_chara_id","getter_decode":"obscured_int_runtime_invoke_path","runtime_validation":"executed"}}"#,
+        target_card_id,
+        target_chara_id,
+        render_slot("first", first),
+        render_slot("second", second),
+    )
+}
+
+// ===== Unified runtime correction E-stage =====
+// ===== Unified pre-release correction F-stage =====
+// ===== Unified release-gate correction G-stage =====
+// ===== Unified response-header capture H-stage =====
+// ===== Unified selected-parent multi-source resolver I-stage =====
+unsafe fn find_exact_instance_method(
+    class: *mut c_void,
+    name: &str,
+    parameter_types: &[&str],
+) -> *const c_void {
+    let get_methods_ptr = resolve_il2cpp_symbol("il2cpp_class_get_methods");
+    let get_name_ptr = resolve_il2cpp_symbol("il2cpp_method_get_name");
+    let get_param_count_ptr = resolve_il2cpp_symbol("il2cpp_method_get_param_count");
+    let get_param_ptr = resolve_il2cpp_symbol("il2cpp_method_get_param");
+    let get_type_name_ptr = resolve_il2cpp_symbol("il2cpp_type_get_name");
+    if class.is_null() || get_methods_ptr.is_null() || get_name_ptr.is_null()
+        || get_param_count_ptr.is_null() || get_param_ptr.is_null() || get_type_name_ptr.is_null() {
+        return ptr::null();
+    }
+    let get_methods: FnClassGetMethods = std::mem::transmute(get_methods_ptr);
+    let get_name: FnMethodGetName = std::mem::transmute(get_name_ptr);
+    let get_param_count: unsafe extern "C" fn(*const c_void) -> u32 = std::mem::transmute(get_param_count_ptr);
+    let get_param: unsafe extern "C" fn(*const c_void, u32) -> *const c_void = std::mem::transmute(get_param_ptr);
+    let get_type_name: unsafe extern "C" fn(*const c_void) -> *const c_char = std::mem::transmute(get_type_name_ptr);
+    let mut iterator = ptr::null_mut();
+    let mut found: *const c_void = ptr::null();
+    loop {
+        let method = get_methods(class, &mut iterator);
+        if method.is_null() { break; }
+        if il2cpp_c_string(get_name(method)) != name || get_param_count(method) as usize != parameter_types.len() { continue; }
+        let mut exact = true;
+        for (index, expected) in parameter_types.iter().enumerate() {
+            let parameter = get_param(method, index as u32);
+            if parameter.is_null() || il2cpp_c_string(get_type_name(parameter)) != *expected { exact = false; break; }
+        }
+        if exact {
+            if !found.is_null() { return ptr::null(); }
+            found = method;
+        }
+    }
+    found
+}
+
+unsafe fn invoke_parent_store_get(store_class: *mut c_void, store: *mut c_void, trained_chara_id: i32) -> *mut c_void {
+    let method = find_exact_instance_method(store_class, "Get", &["System.Int32", "System.Boolean"]);
+    let invoke_ptr = resolve_il2cpp_symbol("il2cpp_runtime_invoke");
+    if method.is_null() || invoke_ptr.is_null() { return ptr::null_mut(); }
+    let invoke: unsafe extern "C" fn(*const c_void, *mut c_void, *mut *mut c_void, *mut *mut c_void) -> *mut c_void = std::mem::transmute(invoke_ptr);
+    let mut id = trained_chara_id;
+    let mut all = true;
+    let mut arguments = [
+        (&mut id as *mut i32).cast::<c_void>(),
+        (&mut all as *mut bool).cast::<c_void>(),
+    ];
+    let mut exception = ptr::null_mut();
+    let result = invoke(method, store, arguments.as_mut_ptr(), &mut exception);
+    if exception.is_null() { result } else { ptr::null_mut() }
+}
+
+unsafe fn selected_parent_record_json(
+    slot: &str,
+    trained_chara_id: i32,
+    own_store_class: *mut c_void,
+    own_store: *mut c_void,
+    succession_store_class: *mut c_void,
+    succession_store: *mut c_void,
+    record_class: *mut c_void,
+) -> String {
+    let mut source = "not_found";
+    let mut record = if own_store.is_null() { ptr::null_mut() } else {
+        invoke_parent_store_get(own_store_class, own_store, trained_chara_id)
+    };
+    if !record.is_null() { source = "trained_chara_data"; }
+    if record.is_null() && !succession_store.is_null() {
+        record = invoke_parent_store_get(succession_store_class, succession_store, trained_chara_id);
+        if !record.is_null() { source = "succession_only_chara_data"; }
+    }
+    if record.is_null() {
+        return format!(r#"{{"slot":"{}","trained_chara_id":{},"resolved":false,"source":"{}","record":null}}"#,
+            slot, trained_chara_id, source);
+    }
+    // Runtime MethodInfo says Id/CardId return System.Int32, while CharaId returns ObscuredInt.
+    let id = call_getter_int(record_class, record, "get_Id");
+    let card_id = call_getter_int(record_class, record, "get_CardId");
+    let chara_id = call_getter_obscured_int(record_class, record, "get_CharaId");
+    // Boolean return values are boxed with one payload byte at object + 0x10.
+    let boxed_bool = |method_name: &str| -> bool {
+        let boxed = call_getter_ref(record_class, record, method_name);
+        !boxed.is_null() && std::ptr::read_unaligned::<u8>((boxed as *const u8).add(16)) != 0
+    };
+    let is_player = boxed_bool("get_IsPlayer");
+    let is_rental = boxed_bool("get_IsRental");
+    let is_others = boxed_bool("get_IsOthers");
+    let is_succession_only = boxed_bool("get_IsSuccessionOnly");
+    format!(r#"{{"slot":"{}","trained_chara_id":{},"resolved":true,"source":"{}","record":{{"id":{},"card_id":{},"chara_id":{},"is_player":{},"is_rental":{},"is_others":{},"is_succession_only":{}}}}}"#,
+        slot, trained_chara_id, source, id, card_id, chara_id, is_player, is_rental, is_others, is_succession_only)
+}
+
+unsafe fn inherit_selected_parent_records_endpoint() -> String {
+    if API.is_null() { return r#"{"ok":false,"error":"api_null"}"#.to_string(); }
+    let image = get_image();
+    if image.is_null() { return r#"{"ok":false,"error":"image_null"}"#.to_string(); }
+    let wdm_class = find_class(image, to_cstr("Gallop").as_ptr(), to_cstr("WorkDataManager").as_ptr());
+    let single_mode_class = find_class(image, to_cstr("Gallop").as_ptr(), to_cstr("WorkSingleModeData").as_ptr());
+    let chara_class = find_class(image, to_cstr("Gallop").as_ptr(), to_cstr("WorkSingleModeCharaData").as_ptr());
+    let own_store_class = find_class(image, to_cstr("Gallop").as_ptr(), to_cstr("WorkTrainedCharaData").as_ptr());
+    let succession_store_class = find_class(image, to_cstr("Gallop").as_ptr(), to_cstr("WorkSuccessionOnlyCharaData").as_ptr());
+    let record_class = find_class_by_short_name(image, "TrainedCharaData");
+    let succession_info_class = find_class_by_short_name(image, "SuccessionCharaInfo");
+    if wdm_class.is_null() || single_mode_class.is_null() || chara_class.is_null()
+        || own_store_class.is_null() || succession_store_class.is_null()
+        || record_class.is_null() || succession_info_class.is_null() {
+        return r#"{"ok":false,"error":"required_class_not_found"}"#.to_string();
+    }
+    let wdm = get_singleton(wdm_class);
+    if wdm.is_null() { return r#"{"ok":false,"error":"work_data_manager_instance_not_found"}"#.to_string(); }
+    let single_mode = call_getter_ref(wdm_class, wdm, "get_SingleMode");
+    let chara = call_getter_ref(single_mode_class, single_mode, "get_Character");
+    if single_mode.is_null() || chara.is_null() { return r#"{"ok":false,"error":"single_mode_character_not_found"}"#.to_string(); }
+    let own_store = call_getter_ref(wdm_class, wdm, "get_TrainedCharaData");
+    let succession_store = call_getter_ref(wdm_class, wdm, "get_SuccessionOnlyCharaData");
+    let first_info = call_getter_ref(chara_class, chara, "get_SuccessionTrainedCharaInfoFirst");
+    let second_info = call_getter_ref(chara_class, chara, "get_SuccessionTrainedCharaInfoSecond");
+    let first_id = if first_info.is_null() { 0 } else { call_getter_obscured_int(succession_info_class, first_info, "get_TrainedCharaId") };
+    let second_id = if second_info.is_null() { 0 } else { call_getter_obscured_int(succession_info_class, second_info, "get_TrainedCharaId") };
+    let first = selected_parent_record_json("first", first_id, own_store_class, own_store, succession_store_class, succession_store, record_class);
+    let second = selected_parent_record_json("second", second_id, own_store_class, own_store, succession_store_class, succession_store, record_class);
+    format!(r#"{{"ok":true,"scope":"selected_parent_record_multisource","lookup_order":["trained_chara_data","succession_only_chara_data"],"selected_temp_lookup":"via_succession_only_get_all_contract","selected_temp_runtime_hit":"pending_device_execution","parents":[{},{}],"ancestor_tree":null,"race_bonus":null,"full_compatibility":null,"runtime_validation":"pending_device_execution"}}"#, first, second)
+}
+
+// ===== Unified selected-parent multi-source resolver I-stage =====
+// ===== Selected-parent runtime semantics J-stage =====
+// ===== Unified K complete observation endpoints =====
+fn k_json_error(error: &str) -> String {
+    format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(error))
+}
+
+fn k_file_sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hex_encode(&hasher.finalize())
+}
+
+fn storage_files_endpoint(uri: &str) -> String {
+    let pairs = match parse_query_pairs(uri) { Ok(v) => v, Err(e) => return k_json_error(&e) };
+    let session_id = query_pair(&pairs, "session_id");
+    if session_id.is_empty() { return k_json_error("missing_session_id"); }
+    let cursor = query_pair(&pairs, "cursor").parse::<i64>().unwrap_or(0).max(0);
+    let limit = query_pair(&pairs, "limit").parse::<i64>().unwrap_or(200).clamp(1, 1000);
+    let connection = match open_observation_storage() { Ok(v) => v, Err(e) => return k_json_error(&e) };
+    let mut statement = match connection.prepare(
+        "SELECT file_id,relative_path,content_type,byte_length,sha256,created_at_ms FROM observation_files WHERE session_id=?1 AND file_id>?2 ORDER BY file_id LIMIT ?3"
+    ) { Ok(v) => v, Err(e) => return k_json_error(&format!("prepare_storage_files:{}", e)) };
+    let rows = match statement.query_map(rusqlite::params![session_id, cursor, limit], |row| {
+        let file_id=row.get::<_,i64>(0)?;
+        let path=row.get::<_,String>(1)?;
+        let content_type=row.get::<_,String>(2)?;
+        let byte_length=row.get::<_,i64>(3)?;
+        let sha=row.get::<_,Option<String>>(4)?;
+        let created=row.get::<_,i64>(5)?;
+        Ok((file_id,path,content_type,byte_length,sha,created))
+    }) { Ok(v) => v, Err(e) => return k_json_error(&format!("query_storage_files:{}", e)) };
+    let mut items=Vec::new();
+    let mut next=cursor;
+    for row in rows {
+        let (id,path,content_type,len,sha,created)=match row { Ok(v)=>v, Err(e)=>return k_json_error(&format!("decode_storage_file:{}",e)) };
+        next=id;
+        let sha_json=sha.map(|v|format!("\"{}\"",json_escape(&v))).unwrap_or_else(||"null".to_string());
+        items.push(format!(r#"{{"file_id":{},"session_id":"{}","relative_path":"{}","content_type":"{}","byte_length":{},"sha256":{},"created_at_ms":{}}}"#,
+            id,json_escape(&session_id),json_escape(&path),json_escape(&content_type),len,sha_json,created));
+    }
+    format!(r#"{{"ok":true,"session_id":"{}","cursor":{},"next_cursor":{},"count":{},"files":[{}]}}"#,
+        json_escape(&session_id),cursor,next,items.len(),items.join(","))
+}
+
+fn storage_download(uri: &str) -> String {
+    let pairs=match parse_query_pairs(uri){Ok(v)=>v,Err(e)=>return k_json_error(&e)};
+    let file_id=match query_pair(&pairs,"file_id").parse::<i64>(){Ok(v) if v>0=>v,_=>return k_json_error("invalid_or_missing_file_id")};
+    let connection=match open_observation_storage(){Ok(v)=>v,Err(e)=>return k_json_error(&e)};
+    let record=connection.query_row(
+        "SELECT session_id,relative_path,content_type,byte_length FROM observation_files WHERE file_id=?1",
+        rusqlite::params![file_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?)));
+    let (session_id,relative,content_type,indexed_len)=match record{
+        Ok(v)=>v,Err(rusqlite::Error::QueryReturnedNoRows)=>return k_json_error("file_not_found"),Err(e)=>return k_json_error(&format!("query_file:{}",e))};
+    let session_root=observation_storage_root().join("sessions").join(&session_id);
+    let target=session_root.join(&relative);
+    let canonical_root=match session_root.canonicalize(){Ok(v)=>v,Err(e)=>return k_json_error(&format!("canonical_session_root:{}",e))};
+    let canonical_target=match target.canonicalize(){Ok(v)=>v,Err(e)=>return k_json_error(&format!("canonical_file:{}",e))};
+    if !canonical_target.starts_with(&canonical_root){return k_json_error("file_outside_session_root");}
+    let bytes=match std::fs::read(&canonical_target){Ok(v)=>v,Err(e)=>return k_json_error(&format!("read_file:{}",e))};
+    if indexed_len>=0 && indexed_len as usize!=bytes.len(){return k_json_error("indexed_length_mismatch");}
+    let sha=k_file_sha256(&bytes);
+    let _=connection.execute("UPDATE observation_files SET sha256=?1,byte_length=?2 WHERE file_id=?3",rusqlite::params![sha,bytes.len() as i64,file_id]);
+    format!(r#"{{"ok":true,"file_id":{},"session_id":"{}","relative_path":"{}","content_type":"{}","byte_length":{},"sha256":"{}","encoding":"hex","body_hex":"{}"}}"#,
+        file_id,json_escape(&session_id),json_escape(&relative),json_escape(&content_type),bytes.len(),sha,hex_encode(&bytes))
+}
+
+unsafe fn k_resolve_method(uri: &str) -> Result<MethodIndexEntry,String> {
+    let pairs=parse_query_pairs(uri)?;
+    let requested=query_pair(&pairs,"declaring_type");
+    let method_name=query_pair(&pairs,"method");
+    let parameter_text=query_pair(&pairs,"parameter_types");
+    if requested.is_empty()||method_name.is_empty(){return Err("missing_declaring_type_or_method".to_string());}
+    let wanted:Vec<String>=if parameter_text.is_empty(){Vec::new()}else{parameter_text.split(',').map(|v|v.trim().to_string()).collect()};
+    let class=find_class_by_full_declaring_name(&requested);
+    if class.is_null(){return Err("class_not_found_or_ambiguous".to_string());}
+    let names=["il2cpp_class_get_methods","il2cpp_method_get_name","il2cpp_method_get_param_count","il2cpp_method_get_param","il2cpp_type_get_name","il2cpp_method_get_return_type","il2cpp_method_get_flags"];
+    let p:Vec<*mut c_void>=names.iter().map(|n|resolve_il2cpp_symbol(n)).collect();
+    if let Some(i)=p.iter().position(|v|v.is_null()){return Err(format!("missing_symbol:{}",names[i]));}
+    let get_methods:FnClassGetMethods=std::mem::transmute(p[0]);
+    let get_name:FnMethodGetName=std::mem::transmute(p[1]);
+    let get_count:unsafe extern "C" fn(*const c_void)->u32=std::mem::transmute(p[2]);
+    let get_param:unsafe extern "C" fn(*const c_void,u32)->*const c_void=std::mem::transmute(p[3]);
+    let get_type_name:unsafe extern "C" fn(*const c_void)->*const c_char=std::mem::transmute(p[4]);
+    let get_return:unsafe extern "C" fn(*const c_void)->*const c_void=std::mem::transmute(p[5]);
+    let get_flags:unsafe extern "C" fn(*const c_void,*mut u32)->u32=std::mem::transmute(p[6]);
+    let mut iterator=ptr::null_mut();
+    let mut matches=Vec::new();
+    loop{
+        let mi=get_methods(class,&mut iterator); if mi.is_null(){break;}
+        if il2cpp_c_string(get_name(mi))!=method_name{continue;}
+        let count=get_count(mi); let mut types=Vec::new();
+        for i in 0..count{let t=get_param(mi,i);types.push(if t.is_null(){"unresolved".to_string()}else{il2cpp_c_string(get_type_name(t))});}
+        if !wanted.is_empty()&&types!=wanted{continue;}
+        let rt=get_return(mi);let mut iflags=0u32;let flags=get_flags(mi,&mut iflags);
+        let pointer=if is_readable_range(mi as usize,std::mem::size_of::<usize>()){std::ptr::read_unaligned::<usize>(mi as *const usize)}else{0};
+        matches.push(MethodIndexEntry{method_info:mi as usize,method_pointer:pointer,namespace:requested.split_once('.').map(|v|v.0.to_string()).unwrap_or_default(),declaring_type:requested.clone(),method_name:method_name.clone(),return_type:if rt.is_null(){"unresolved".to_string()}else{il2cpp_c_string(get_type_name(rt))},parameter_names:vec![None;types.len()],parameter_types:types,flags});
+    }
+    if matches.len()!=1{return Err(if matches.is_empty(){"method_not_found".to_string()}else{"method_ambiguous".to_string()});}
+    Ok(matches.remove(0))
+}
+
+unsafe fn il2cpp_call_targets(uri: &str) -> String {
+    let entry=match k_resolve_method(uri){Ok(v)=>v,Err(e)=>return k_json_error(&e)};
+    if entry.method_pointer==0{return k_json_error("method_pointer_null");}
+    let pairs=match parse_query_pairs(uri){Ok(v)=>v,Err(e)=>return k_json_error(&e)};
+    let instruction_limit=query_pair(&pairs,"instruction_limit").parse::<usize>().unwrap_or(1024).clamp(1,4096);
+    let byte_len=instruction_limit*4;
+    if !is_readable_range(entry.method_pointer,byte_len){return k_json_error("method_range_not_readable");}
+    let code=std::slice::from_raw_parts(entry.method_pointer as *const u8,byte_len);
+    let mut targets=Vec::new();
+    for i in 0..instruction_limit{
+        let off=i*4;let ins=u32::from_le_bytes([code[off],code[off+1],code[off+2],code[off+3]]);
+        if ins&0xfc000000==0x94000000{
+            let imm=((ins&0x03ffffff) as i32)<<6>>4;
+            let target=(entry.method_pointer as isize+off as isize+imm as isize) as usize;
+            targets.push(format!(r#"{{"instruction_offset":{},"instruction":"0x{:08x}","target_address":"0x{:x}"}}"#,off,ins,target));
+        }
+    }
+    format!(r#"{{"ok":true,"resolution":"single_declaring_type_method","method":{},"instruction_limit":{},"direct_bl_count":{},"targets":[{}]}}"#,method_entry_json(&entry,None),instruction_limit,targets.len(),targets.join(","))
+}
+
+unsafe fn il2cpp_callers(uri: &str) -> String {
+    let target=match k_resolve_method(uri){Ok(v)=>v,Err(e)=>return k_json_error(&e)};
+    let pairs=match parse_query_pairs(uri){Ok(v)=>v,Err(e)=>return k_json_error(&e)};
+    let cursor=query_pair(&pairs,"cursor").parse::<usize>().unwrap_or(0);
+    let limit=query_pair(&pairs,"limit").parse::<usize>().unwrap_or(100).clamp(1,1000);
+    let state=METHOD_INDEX.lock().unwrap_or_else(|e|e.into_inner());
+    if state.status!="ready"{return format!(r#"{{"ok":false,"error":"method_index_not_ready","index_status":"{}","target":{}}}"#,state.status,method_entry_json(&target,None));}
+    let mut out=Vec::new();let mut matched=0usize;
+    for caller in &state.entries{
+        if caller.method_pointer==0||!is_readable_range(caller.method_pointer,4096){continue;}
+        let code=std::slice::from_raw_parts(caller.method_pointer as *const u8,4096);
+        for i in 0..1024{let off=i*4;let ins=u32::from_le_bytes([code[off],code[off+1],code[off+2],code[off+3]]);if ins&0xfc000000!=0x94000000{continue;}let imm=((ins&0x03ffffff) as i32)<<6>>4;let dest=(caller.method_pointer as isize+off as isize+imm as isize) as usize;if dest==target.method_pointer{if matched>=cursor&&out.len()<limit{out.push(format!(r#"{{"caller":{},"instruction_offset":{}}}"#,method_entry_json(caller,None),off));}matched+=1;}}
+    }
+    format!(r#"{{"ok":true,"target":{},"cursor":{},"next_cursor":{},"total_direct_call_sites":{},"callers":[{}]}}"#,method_entry_json(&target,None),cursor,cursor+out.len(),matched,out.join(","))
+}
+
+unsafe fn il2cpp_type_detail(uri: &str) -> String {
+    let pairs=match parse_query_pairs(uri){Ok(v)=>v,Err(e)=>return k_json_error(&e)};let requested=query_pair(&pairs,"type");if requested.is_empty(){return k_json_error("missing_type");}
+    let class=find_class_by_full_declaring_name(&requested);if class.is_null(){return k_json_error("class_not_found_or_ambiguous");}
+    let fields=enumerate_class_fields(class);let methods=enumerate_class_methods(class);
+    format!(r#"{{"ok":true,"requested":"{}","class_pointer":"0x{:x}","fields":{},"methods":{}}}"#,json_escape(&requested),class as usize,fields,methods)
+}
+
+unsafe fn il2cpp_object_dump(uri: &str) -> String {
+    let pairs=match parse_query_pairs(uri){Ok(v)=>v,Err(e)=>return k_json_error(&e)};let requested=query_pair(&pairs,"type");let address=match parse_address(&query_pair(&pairs,"address")){Some(v) if v!=0=>v,_=>return k_json_error("invalid_or_missing_address")};
+    if requested.is_empty(){return k_json_error("missing_type");}let class=find_class_by_full_declaring_name(&requested);if class.is_null(){return k_json_error("class_not_found_or_ambiguous");}if !is_readable_range(address,16){return k_json_error("object_address_not_readable");}
+    let field_ptr=resolve_il2cpp_symbol("il2cpp_class_get_fields");let name_ptr=resolve_il2cpp_symbol("il2cpp_field_get_name");let offset_ptr=resolve_il2cpp_symbol("il2cpp_field_get_offset");if field_ptr.is_null()||name_ptr.is_null()||offset_ptr.is_null(){return k_json_error("field_api_unavailable");}
+    let get_fields:unsafe extern "C" fn(*mut c_void,*mut *mut c_void)->*mut c_void=std::mem::transmute(field_ptr);let get_name:unsafe extern "C" fn(*mut c_void)->*const c_char=std::mem::transmute(name_ptr);let get_offset:unsafe extern "C" fn(*mut c_void)->i32=std::mem::transmute(offset_ptr);
+    let mut iterator=ptr::null_mut();let mut items=Vec::new();loop{let f=get_fields(class,&mut iterator);if f.is_null(){break;}let off=get_offset(f);if off<0{continue;}let p=address.saturating_add(off as usize);let readable=is_readable_range(p,8);let raw=if readable{format!("{:016x}",std::ptr::read_unaligned::<u64>(p as *const u64))}else{String::new()};items.push(format!(r#"{{"name":"{}","offset":{},"address":"0x{:x}","readable":{},"raw_u64_le_hex":"{}"}}"#,json_escape(&il2cpp_c_string(get_name(f))),off,p,readable,raw));}
+    format!(r#"{{"ok":true,"type":"{}","object_address":"0x{:x}","depth":1,"field_count":{},"fields":[{}]}}"#,json_escape(&requested),address,items.len(),items.join(","))
+}
+
+// ===== Protocol archive reliability P-stage =====
+#[derive(Default)]
+struct ProtocolArchiveAudit {
+    request_ids: std::collections::BTreeSet<u64>,
+    response_ids: std::collections::BTreeSet<u64>,
+    request_files: usize,
+    response_files: usize,
+    request_bytes: u64,
+    response_bytes: u64,
+    zero_length_files: Vec<String>,
+    indexed_length_mismatches: Vec<String>,
+}
+
+fn protocol_path_request_id(relative_path: &str, direction: &str) -> Option<u64> {
+    let prefix = format!("protocol/{}/", direction);
+    let remainder = relative_path.strip_prefix(&prefix)?;
+    let component = remainder.split('/').next()?;
+    let numeric = if direction == "response" {
+        component.split('-').next().unwrap_or(component)
+    } else {
+        component
+    };
+    numeric.parse::<u64>().ok()
+}
+
+fn protocol_archive_rows(session_id: &str) -> Result<Vec<(i64, String, String, i64, Option<String>, i64)>, String> {
+    let connection = open_observation_storage()?;
+    let mut statement = connection.prepare(
+        "SELECT file_id,relative_path,content_type,byte_length,sha256,created_at_ms \
+         FROM observation_files WHERE session_id=?1 AND relative_path LIKE 'protocol/%' \
+         ORDER BY file_id"
+    ).map_err(|error| format!("prepare_protocol_archive:{}", error))?;
+    let mapped = statement.query_map(rusqlite::params![session_id], |row| Ok((
+        row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+        row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, i64>(5)?,
+    ))).map_err(|error| format!("query_protocol_archive:{}", error))?;
+    let mut rows = Vec::new();
+    for row in mapped {
+        rows.push(row.map_err(|error| format!("decode_protocol_archive:{}", error))?);
+    }
+    Ok(rows)
+}
+
+fn protocol_file_json(row: &(i64, String, String, i64, Option<String>, i64)) -> String {
+    let sha = row.4.as_ref().map(|value| format!("\"{}\"", json_escape(value)))
+        .unwrap_or_else(|| "null".to_string());
+    format!(r#"{{"file_id":{},"relative_path":"{}","content_type":"{}","byte_length":{},"sha256":{},"created_at_ms":{},"download":"/storage/download?file_id={}"}}"#,
+        row.0, json_escape(&row.1), json_escape(&row.2), row.3, sha, row.5, row.0)
+}
+
+fn protocol_exchange_export_endpoint(uri: &str) -> String {
+    let pairs = match parse_query_pairs(uri) { Ok(value) => value, Err(error) => return k_json_error(&error) };
+    let session_id = query_pair(&pairs, "session_id");
+    if session_id.is_empty() { return k_json_error("missing_session_id"); }
+    let request_id = match query_pair(&pairs, "request_id").parse::<u64>() {
+        Ok(value) if value > 0 => value,
+        _ => return k_json_error("invalid_or_missing_request_id"),
+    };
+    let rows = match protocol_archive_rows(&session_id) { Ok(value) => value, Err(error) => return k_json_error(&error) };
+    let request: Vec<_> = rows.iter().filter(|row| protocol_path_request_id(&row.1, "request") == Some(request_id)).collect();
+    let response: Vec<_> = rows.iter().filter(|row| protocol_path_request_id(&row.1, "response") == Some(request_id)).collect();
+    let request_json = request.iter().map(|row| protocol_file_json(row)).collect::<Vec<_>>().join(",");
+    let response_json = response.iter().map(|row| protocol_file_json(row)).collect::<Vec<_>>().join(",");
+    format!(r#"{{"ok":true,"session_id":"{}","request_id":{},"paired":{},"request_file_count":{},"response_file_count":{},"request_files":[{}],"response_files":[{}]}}"#,
+        json_escape(&session_id), request_id, !request.is_empty() && !response.is_empty(),
+        request.len(), response.len(), request_json, response_json)
+}
+
+fn protocol_exchanges_export_endpoint(uri: &str) -> String {
+    let pairs = match parse_query_pairs(uri) { Ok(value) => value, Err(error) => return k_json_error(&error) };
+    let session_id = query_pair(&pairs, "session_id");
+    if session_id.is_empty() { return k_json_error("missing_session_id"); }
+    let after = query_pair(&pairs, "after_request_id").parse::<u64>().unwrap_or(0);
+    let limit = query_pair(&pairs, "limit").parse::<usize>().unwrap_or(200).clamp(1, 1000);
+    let rows = match protocol_archive_rows(&session_id) { Ok(value) => value, Err(error) => return k_json_error(&error) };
+    let mut request_ids = std::collections::BTreeSet::new();
+    let mut response_ids = std::collections::BTreeSet::new();
+    for row in &rows {
+        if let Some(value) = protocol_path_request_id(&row.1, "request") { request_ids.insert(value); }
+        if let Some(value) = protocol_path_request_id(&row.1, "response") { response_ids.insert(value); }
+    }
+    let selected: Vec<u64> = request_ids.union(&response_ids).copied().filter(|value| *value > after).take(limit).collect();
+    let items = selected.iter().map(|request_id| format!(
+        r#"{{"request_id":{},"has_request":{},"has_response":{},"paired":{},"export":"/api/sniff/exchange?session_id={}&request_id={}"}}"#,
+        request_id, request_ids.contains(request_id), response_ids.contains(request_id),
+        request_ids.contains(request_id) && response_ids.contains(request_id),
+        json_escape(&session_id), request_id
+    )).collect::<Vec<_>>();
+    let next = selected.last().copied().unwrap_or(after);
+    format!(r#"{{"ok":true,"session_id":"{}","after_request_id":{},"next_request_id":{},"count":{},"exchanges":[{}]}}"#,
+        json_escape(&session_id), after, next, items.len(), items.join(","))
+}
+
+fn protocol_archive_audit_endpoint(uri: &str) -> String {
+    let pairs = match parse_query_pairs(uri) { Ok(value) => value, Err(error) => return k_json_error(&error) };
+    let session_id = query_pair(&pairs, "session_id");
+    if session_id.is_empty() { return k_json_error("missing_session_id"); }
+    let rows = match protocol_archive_rows(&session_id) { Ok(value) => value, Err(error) => return k_json_error(&error) };
+    let mut audit = ProtocolArchiveAudit::default();
+    let session_root = observation_storage_root().join("sessions").join(&session_id);
+    for row in &rows {
+        let direction = if row.1.starts_with("protocol/request/") { "request" } else if row.1.starts_with("protocol/response/") { "response" } else { continue };
+        if let Some(request_id) = protocol_path_request_id(&row.1, direction) {
+            if direction == "request" { audit.request_ids.insert(request_id); audit.request_files += 1; audit.request_bytes = audit.request_bytes.saturating_add(row.3.max(0) as u64); }
+            else { audit.response_ids.insert(request_id); audit.response_files += 1; audit.response_bytes = audit.response_bytes.saturating_add(row.3.max(0) as u64); }
+        }
+        if row.3 == 0 { audit.zero_length_files.push(row.1.clone()); }
+        match std::fs::metadata(session_root.join(&row.1)) {
+            Ok(metadata) if metadata.len() != row.3.max(0) as u64 => audit.indexed_length_mismatches.push(row.1.clone()),
+            Err(_) => audit.indexed_length_mismatches.push(row.1.clone()),
+            _ => {}
+        }
+    }
+    let missing_response: Vec<u64> = audit.request_ids.difference(&audit.response_ids).copied().collect();
+    let orphan_response: Vec<u64> = audit.response_ids.difference(&audit.request_ids).copied().collect();
+    let u64_json = |values: &[u64]| values.iter().map(|value| value.to_string()).collect::<Vec<_>>().join(",");
+    let path_json = |values: &[String]| values.iter().map(|value| format!("\"{}\"", json_escape(value))).collect::<Vec<_>>().join(",");
+    format!(r#"{{"ok":true,"session_id":"{}","request_count":{},"response_count":{},"paired_count":{},"request_file_count":{},"response_file_count":{},"request_bytes":{},"response_bytes":{},"missing_response_ids":[{}],"orphan_response_ids":[{}],"zero_length_files":[{}],"indexed_length_mismatches":[{}]}}"#,
+        json_escape(&session_id), audit.request_ids.len(), audit.response_ids.len(),
+        audit.request_ids.intersection(&audit.response_ids).count(), audit.request_files, audit.response_files,
+        audit.request_bytes, audit.response_bytes, u64_json(&missing_response), u64_json(&orphan_response),
+        path_json(&audit.zero_length_files), path_json(&audit.indexed_length_mismatches))
+}
+
+fn k_observation_files(domain: &str, uri: &str) -> String {
+    let pairs=match parse_query_pairs(uri){Ok(v)=>v,Err(e)=>return k_json_error(&e)};let requested_session=query_pair(&pairs,"session_id");let connection=match open_observation_storage(){Ok(v)=>v,Err(e)=>return k_json_error(&e)};
+    let session_id=if requested_session.is_empty(){match ensure_observation_session(){Ok(v)=>v,Err(e)=>return k_json_error(&e)}}else{requested_session};
+    let token=domain.replace('/',"_");let like=format!("%{}%",token);
+    let mut statement=match connection.prepare("SELECT file_id,relative_path,content_type,byte_length,created_at_ms FROM observation_files WHERE session_id=?1 AND (relative_path LIKE ?2 OR relative_path LIKE '%protocol%') ORDER BY file_id") {Ok(v)=>v,Err(e)=>return k_json_error(&format!("prepare_domain_history:{}",e))};
+    let rows=match statement.query_map(rusqlite::params![session_id,like],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?))){Ok(v)=>v,Err(e)=>return k_json_error(&format!("query_domain_history:{}",e))};
+    let mut items=Vec::new();for row in rows{let(id,path,ct,len,created)=match row{Ok(v)=>v,Err(e)=>return k_json_error(&format!("decode_domain_history:{}",e))};items.push(format!(r#"{{"file_id":{},"relative_path":"{}","content_type":"{}","byte_length":{},"created_at_ms":{}}}"#,id,json_escape(&path),json_escape(&ct),len,created));}
+    format!(r#"{{"ok":true,"domain":"{}","session_id":"{}","evidence_status":"observed_files","count":{},"files":[{}]}}"#,json_escape(domain),json_escape(&session_id),items.len(),items.join(","))
+}
+
+unsafe fn inherit_tree_endpoint() -> String { inherit_selected_parent_records_endpoint() }
+fn factor_history_endpoint(uri:&str)->String{k_observation_files("factor/history",uri)}
+
+fn k_domain_endpoint(path:&str,uri:&str)->String{
+    match path{
+        "/factor/history"=>factor_history_endpoint(uri),
+        "/factor/stats"=>k_observation_files("factor/stats",uri),
+        "/factor/probability_model"=>k_observation_files("factor/probability_model",uri),
+        "/factor/breeding_advice"=>k_observation_files("factor/breeding_advice",uri),
+        "/api/sniff/exchanges"=>protocol_exchanges_export_endpoint(uri),
+        "/api/sniff/exchange"=>protocol_exchange_export_endpoint(uri),
+        _=>k_observation_files(path.trim_start_matches('/'),uri),
+    }
+}
+// ===== Unified K complete observation endpoints =====
+// ===== Generated succession runtime L support fix =====
+// ===== Generated succession runtime decoder L =====
+unsafe fn l_array_objects(array: *mut c_void) -> Result<Vec<*mut c_void>, String> {
+    if array.is_null() || !is_readable_range(array as usize + 0x18, 8) { return Err("array_not_readable".to_string()); }
+    let len = std::ptr::read_unaligned::<usize>((array as usize + 0x18) as *const usize);
+    if len > 10000 { return Err(format!("array_length_out_of_range:{}", len)); }
+    if len > 0 && !is_readable_range(array as usize + 0x20, len * 8) { return Err("array_elements_not_readable".to_string()); }
+    Ok((0..len).map(|i| std::ptr::read_unaligned::<*mut c_void>((array as usize + 0x20 + i * 8) as *const *mut c_void)).collect())
+}
+
+unsafe fn l_named_i32(object: *mut c_void, candidates: &[&str]) -> Option<i32> {
+    if object.is_null() || !is_readable_range(object as usize, 8) { return None; }
+    let class = std::ptr::read_unaligned::<*mut c_void>(object as *const *mut c_void);
+    let gf=resolve_il2cpp_symbol("il2cpp_class_get_fields"); let gn=resolve_il2cpp_symbol("il2cpp_field_get_name"); let go=resolve_il2cpp_symbol("il2cpp_field_get_offset");
+    if class.is_null() || gf.is_null() || gn.is_null() || go.is_null() { return None; }
+    let get_fields: unsafe extern "C" fn(*mut c_void,*mut *mut c_void)->*mut c_void=std::mem::transmute(gf);
+    let get_name: unsafe extern "C" fn(*mut c_void)->*const c_char=std::mem::transmute(gn);
+    let get_offset: unsafe extern "C" fn(*mut c_void)->i32=std::mem::transmute(go);
+    let mut it=ptr::null_mut();
+    loop { let f=get_fields(class,&mut it); if f.is_null(){break;} let name=il2cpp_c_string(get_name(f)); if candidates.iter().any(|v|*v==name){let off=get_offset(f);if off>=0&&is_readable_range(object as usize+off as usize,4){return Some(std::ptr::read_unaligned::<i32>((object as usize+off as usize) as *const i32));}} }
+    None
+}
+
+unsafe fn l_factor_json(factor_class:*mut c_void, object:*mut c_void)->String{
+    format!(r#"{{"factor_id":{},"factor_lv":{}}}"#,call_getter_obscured_int(factor_class,object,"get_FactorId"),call_getter_obscured_int(factor_class,object,"get_FactorLv"))
+}
+unsafe fn l_race_json(race_class:*mut c_void, object:*mut c_void)->String{
+    format!(r#"{{"turn":{},"program_id":{},"race_instance_id":{},"frame_order":{},"entry_num":{},"weather":{},"ground_condition":{},"running_style":{},"result_rank":{},"scenario_id":{}}}"#,
+      call_getter_obscured_int(race_class,object,"get_Turn"),call_getter_obscured_int(race_class,object,"get_ProgramId"),call_getter_obscured_int(race_class,object,"get_RaceInstanceId"),call_getter_obscured_int(race_class,object,"get_FrameOrder"),call_getter_obscured_int(race_class,object,"get_EntryNum"),call_getter_obscured_int(race_class,object,"get_Weather"),call_getter_obscured_int(race_class,object,"get_GroundCondition"),call_getter_obscured_int(race_class,object,"get_RunningStyle"),call_getter_obscured_int(race_class,object,"get_ResultRank"),call_getter_obscured_int(race_class,object,"get_ScenarioId"))
+}
+unsafe fn generated_succession_runtime_endpoint()->String{
+    if API.is_null(){return k_json_error("api_null");} let image=get_image();if image.is_null(){return k_json_error("image_null");}
+    let wdm_class=find_class(image,to_cstr("Gallop").as_ptr(),to_cstr("WorkDataManager").as_ptr());
+    let store_class=find_class(image,to_cstr("Gallop").as_ptr(),to_cstr("WorkSuccessionOnlyCharaData").as_ptr());
+    let wrapper_class=find_class_by_short_name(image,"GenerateSuccessionCharaData"); let trained_class=find_class_by_short_name(image,"TrainedCharaData");let race_class=find_class_by_short_name(image,"RaceHistoryInfo");let factor_class=find_class_by_short_name(image,"FactorData");let support_class=find_class_by_full_declaring_name("Gallop.WorkTrainedCharaData/SupportCardData");
+    if wdm_class.is_null()||store_class.is_null()||wrapper_class.is_null()||trained_class.is_null()||race_class.is_null()||factor_class.is_null()||support_class.is_null(){return k_json_error("required_class_not_found");}
+    let wdm=get_singleton(wdm_class);if wdm.is_null(){return k_json_error("work_data_manager_instance_not_found");}let store=call_getter_ref(wdm_class,wdm,"get_SuccessionOnlyCharaData");if store.is_null(){return k_json_error("succession_only_store_not_found");}
+    let list=call_getter_ref(store_class,store,"get_GeneratedList");if list.is_null()||!is_readable_range(list as usize+0x18,4){return k_json_error("generated_list_not_found");}let size=std::ptr::read_unaligned::<i32>((list as usize+0x18) as *const i32);if !(0..=100).contains(&size){return k_json_error("generated_list_size_out_of_range");}let items=std::ptr::read_unaligned::<*mut c_void>((list as usize+0x10) as *const *mut c_void);if items.is_null(){return k_json_error("generated_list_items_null");}
+    let mut generated=Vec::new();for i in 0..size as usize{let wrapper=std::ptr::read_unaligned::<*mut c_void>((items as usize+0x20+i*8) as *const *mut c_void);if wrapper.is_null(){return k_json_error("generated_wrapper_null");}let position=std::ptr::read_unaligned::<i32>((wrapper as usize+0x10) as *const i32);let trained=call_getter_ref(wrapper_class,wrapper,"get_TrainedCharaData");if trained.is_null(){return k_json_error("trained_chara_null");}
+      let factor_array=call_getter_ref(trained_class,trained,"get_FactorDataArray");let race_array=call_getter_ref(trained_class,trained,"get_SingleModeRaceResultArray");let support_array=call_getter_ref(trained_class,trained,"get_SupportCardArray");
+      let factors=match l_array_objects(factor_array){Ok(v)=>v.into_iter().map(|x|l_factor_json(factor_class,x)).collect::<Vec<_>>(),Err(e)=>return k_json_error(&format!("factor_{}",e))};let races=match l_array_objects(race_array){Ok(v)=>v.into_iter().map(|x|l_race_json(race_class,x)).collect::<Vec<_>>(),Err(e)=>return k_json_error(&format!("race_{}",e))};let supports=match l_array_objects(support_array){Ok(v)=>v.into_iter().map(|x|format!(r#"{{"position":{},"support_card_id":{},"limit_break_count":{}}}"#,call_getter_obscured_int(support_class,x,"get_Position"),call_getter_obscured_int(support_class,x,"get_SupportCardId"),call_getter_obscured_int(support_class,x,"get_LimitBreakCount"))).collect::<Vec<_>>(),Err(e)=>return k_json_error(&format!("support_{}",e))};
+      generated.push(format!(r#"{{"position":{},"card_id":{},"chara_id":{},"scenario_id":{},"single_total_race_num":{},"single_win_num":{},"proper":{{"ground_turf":{},"ground_dirt":{},"distance_short":{},"distance_mile":{},"distance_middle":{},"distance_long":{},"running_nige":{},"running_senko":{},"running_sashi":{},"running_oikomi":{}}},"factors":[{}],"support_cards":[{}],"races":[{}]}}"#,position,call_getter_int(trained_class,trained,"get_CardId"),call_getter_obscured_int(trained_class,trained,"get_CharaId"),call_getter_obscured_int(trained_class,trained,"get_ScenarioId"),call_getter_int(trained_class,trained,"get_SingleTotalRaceNum"),call_getter_obscured_int(trained_class,trained,"get_SingleWinNum"),call_getter_obscured_int(trained_class,trained,"get_ProperGroundTurf"),call_getter_obscured_int(trained_class,trained,"get_ProperGroundDirt"),call_getter_obscured_int(trained_class,trained,"get_ProperDistanceShort"),call_getter_obscured_int(trained_class,trained,"get_ProperDistanceMile"),call_getter_obscured_int(trained_class,trained,"get_ProperDistanceMiddle"),call_getter_obscured_int(trained_class,trained,"get_ProperDistanceLong"),call_getter_obscured_int(trained_class,trained,"get_ProperRunningStyleNige"),call_getter_obscured_int(trained_class,trained,"get_ProperRunningStyleSenko"),call_getter_obscured_int(trained_class,trained,"get_ProperRunningStyleSashi"),call_getter_obscured_int(trained_class,trained,"get_ProperRunningStyleOikomi"),factors.join(","),supports.join(","),races.join(",")));
+    }
+    format!(r#"{{"ok":true,"scope":"generated_succession_runtime_full","count":{},"storage_order":"generated_list_index","generated":[{}]}}"#,generated.len(),generated.join(","))
+}
+// ===== Generated succession runtime decoder L =====
+// ===== Ramen/Hachimi global durable observation M-stage =====
+// ===== Hachimi TextCommon final display observer N-stage =====
+static mut TEXT_COMMON_SET_TEXT_ADDR: usize = 0;
+
+// 先执行原始set_text，再读取同一TextCommon对象的get_text。
+// 这样同时保存调用输入与该调用返回时组件实际持有的显示文本，不把输入值冒充最终汉化结果。
+extern "C" fn text_common_set_text_hook_handler(this: *mut c_void, input: *const c_void) {
+    unsafe {
+        let trampoline = interceptor_get_trampoline(text_common_set_text_hook_handler as usize);
+        if trampoline == 0 { return; }
+        type FnType = unsafe extern "C" fn(*mut c_void, *const c_void);
+        let original: FnType = std::mem::transmute(trampoline);
+        original(this, input);
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let input_text = read_il2cpp_string(input);
+            let displayed_text = if this.is_null() {
+                String::new()
+            } else {
+                read_il2cpp_string_from_obj(this, "get_text")
+            };
+            let payload = format!(
+                r#"{{"hook":"Gallop.TextCommon.set_text(System.String)","object":"0x{:x}","input_text":"{}","displayed_text_after_original":"{}","displayed_text_status":"read_after_original_get_text"}}"#,
+                this as usize, json_escape(&input_text), json_escape(&displayed_text)
+            );
+            if let Err(error) = append_global_observation("ui_text", "complete", &payload, false) {
+                storage_set_error(&format!("persist_ui_text:{}", error));
+            }
+        }));
+    }
+}
+
+unsafe fn install_text_common_observer_hook() {
+    if TEXT_COMMON_SET_TEXT_ADDR != 0 { return; }
+    if API.is_null() {
+        set_hook_status("ui_text.text_common_set_text", "failed: api_null");
+        return;
+    }
+    let api = &*API;
+    if api.interceptor == 0 {
+        set_hook_status("ui_text.text_common_set_text", "failed: interceptor_unavailable");
+        return;
+    }
+    let get_assembly_image = match api.il2cpp_get_assembly_image_fn {
+        Some(value) => value,
+        None => {
+            set_hook_status("ui_text.text_common_set_text", "failed: assembly_api_unavailable");
+            return;
+        }
+    };
+    let get_class = match api.il2cpp_get_class_fn {
+        Some(value) => value,
+        None => {
+            set_hook_status("ui_text.text_common_set_text", "failed: class_api_unavailable");
+            return;
+        }
+    };
+    let get_method_addr = match api.il2cpp_get_method_addr_fn {
+        Some(value) => value,
+        None => {
+            set_hook_status("ui_text.text_common_set_text", "failed: method_api_unavailable");
+            return;
+        }
+    };
+    let image = get_assembly_image(to_cstr("umamusume.dll").as_ptr());
+    if image.is_null() {
+        set_hook_status("ui_text.text_common_set_text", "failed: image_not_found");
+        return;
+    }
+    let class = get_class(image, to_cstr("Gallop").as_ptr(), to_cstr("TextCommon").as_ptr());
+    if class.is_null() {
+        set_hook_status("ui_text.text_common_set_text", "failed: class_not_found");
+        return;
+    }
+    let address = get_method_addr(class as usize, to_cstr("set_text").as_ptr(), 1);
+    if address == 0 {
+        set_hook_status("ui_text.text_common_set_text", "failed: method_not_found");
+        return;
+    }
+    if interceptor_hook(address, text_common_set_text_hook_handler as usize) {
+        TEXT_COMMON_SET_TEXT_ADDR = address;
+        set_hook_status("ui_text.text_common_set_text", &format!("hooked@0x{:x}", address));
+    } else {
+        set_hook_status("ui_text.text_common_set_text", "failed: interceptor_hook");
+    }
+}
+
+// ===== Protocol multi-section event timeline O-stage =====
+// ===== Protocol archive reliability P-stage =====
+// ===== Next-generation passive init and HookRegistry foundation =====
+#[derive(Clone)]
+struct FoundationHookRecord {
+    hook_id: &'static str,
+    role: &'static str,
+    assembly: &'static str,
+    namespace: &'static str,
+    declaring_type: &'static str,
+    method: &'static str,
+    parameter_types: &'static [&'static str],
+    return_type: &'static str,
+    module_name: &'static str,
+    target_address: usize,
+}
+
+struct FoundationInitStateData {
+    phase: String,
+    generation: u64,
+    attempts: u64,
+    first_observed_wall_clock_ms: u64,
+    last_transition_wall_clock_ms: u64,
+    last_transition_monotonic_ns: u64,
+}
+
+static FOUNDATION_INIT_STATE: Mutex<Option<FoundationInitStateData>> = Mutex::new(None);
+
+fn foundation_monotonic_ns() -> u64 {
+    unsafe {
+        let mut value: libc::timespec = std::mem::zeroed();
+        if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) != 0 {
+            return 0;
+        }
+        (value.tv_sec.max(0) as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(value.tv_nsec.max(0) as u64)
+    }
+}
+
+unsafe fn foundation_hook_records() -> Vec<FoundationHookRecord> {
+    vec![
+        FoundationHookRecord {
+            hook_id: "protocol.compress_request", role: "core", assembly: "umamusume.dll",
+            namespace: "Gallop", declaring_type: "HttpHelper", method: "CompressRequest",
+            parameter_types: &["System.Byte[]"], return_type: "System.Byte[]",
+            module_name: "libil2cpp.so", target_address: COMPRESS_REQUEST_ADDR,
+        },
+        FoundationHookRecord {
+            hook_id: "protocol.decompress_response", role: "core", assembly: "umamusume.dll",
+            namespace: "Gallop", declaring_type: "HttpHelper", method: "DecompressResponse",
+            parameter_types: &["System.Byte[]"], return_type: "System.Byte[]",
+            module_name: "libil2cpp.so", target_address: DECOMPRESS_RESPONSE_ADDR,
+        },
+        FoundationHookRecord {
+            hook_id: "protocol.www_post", role: "core", assembly: "Cute.Http.Assembly.dll",
+            namespace: "Cute.Http", declaring_type: "WWWRequest", method: "Post",
+            parameter_types: &["System.String", "System.Byte[]", "System.Collections.Generic.Dictionary<System.String,System.String>"],
+            return_type: "UnityEngine.Networking.UnityWebRequestAsyncOperation",
+            module_name: "libil2cpp.so", target_address: POST_ADDR,
+        },
+        FoundationHookRecord {
+            hook_id: "protocol.unity_send", role: "core", assembly: "UnityEngine.UnityWebRequestModule.dll",
+            namespace: "UnityEngine.Networking", declaring_type: "UnityWebRequest", method: "SendWebRequest",
+            parameter_types: &[], return_type: "UnityEngine.Networking.UnityWebRequestAsyncOperation",
+            module_name: "libil2cpp.so", target_address: UNITY_SEND_ADDR,
+        },
+        FoundationHookRecord {
+            hook_id: "protocol.unity_completion", role: "core", assembly: "UnityEngine.CoreModule.dll",
+            namespace: "UnityEngine", declaring_type: "AsyncOperation", method: "InvokeCompletionEvent",
+            parameter_types: &[], return_type: "System.Void",
+            module_name: "libil2cpp.so", target_address: UNITY_COMPLETE_ADDR,
+        },
+        FoundationHookRecord {
+            hook_id: "ui.text_common_set_text", role: "optional", assembly: "umamusume.dll",
+            namespace: "Gallop", declaring_type: "TextCommon", method: "set_text",
+            parameter_types: &["System.String"], return_type: "System.Void",
+            module_name: "libil2cpp.so", target_address: TEXT_COMMON_SET_TEXT_ADDR,
+        },
+    ]
+}
+
+fn foundation_parameter_types_json(values: &[&str]) -> String {
+    values.iter().map(|value| format!("\"{}\"", json_escape(value)))
+        .collect::<Vec<_>>().join(",")
+}
+
+fn foundation_hook_record_json(record: &FoundationHookRecord) -> String {
+    let address = if record.target_address == 0 {
+        "null".to_string()
+    } else {
+        format!("\"0x{:x}\"", record.target_address)
+    };
+    let owner = if record.target_address == 0 { "null" } else { "\"hlpatch_legacy_chain\"" };
+    let state = if record.target_address == 0 { "not_observed" } else { "legacy_installed_unverified" };
+    format!(
+        r#"{{"hook_id":"{}","role":"{}","key":{{"assembly":"{}","namespace":"{}","declaring_type":"{}","method":"{}","parameter_types":[{}],"return_type":"{}"}},"method_info":null,"target_address":{},"module_name":"{}","module_base":null,"module_generation":null,"mapping_permissions":null,"alignment_valid":{},"original_prologue_bytes":null,"current_prologue_bytes":null,"prologue_fingerprint":null,"external_hook_present":null,"owner":{},"install_generation":null,"install_state":"{}","trampoline_address":null,"call_count":null,"last_call_monotonic_ns":null,"last_error_stage":null,"last_error_raw":null}}"#,
+        json_escape(record.hook_id), json_escape(record.role), json_escape(record.assembly),
+        json_escape(record.namespace), json_escape(record.declaring_type), json_escape(record.method),
+        foundation_parameter_types_json(record.parameter_types), json_escape(record.return_type), address,
+        json_escape(record.module_name), record.target_address != 0 && record.target_address % 4 == 0,
+        owner, state
+    )
+}
+
+fn foundation_legacy_hook_errors() -> Vec<(String, String)> {
+    HOOK_STATUS.lock().map(|values| {
+        values.iter().filter(|(_, status)| status.starts_with("failed:"))
+            .cloned().collect::<Vec<_>>()
+    }).unwrap_or_default()
+}
+
+unsafe fn foundation_observed_phase(records: &[FoundationHookRecord]) -> (&'static str, &'static str) {
+    if API.is_null() {
+        return ("waiting_domain", "hachimi_api_null");
+    }
+    if (*API).il2cpp_get_assembly_image_fn.is_none() {
+        return ("waiting_assemblies", "assembly_image_api_unavailable");
+    }
+    if !GAME_INITIALIZED.load(Ordering::Acquire) {
+        return ("probing_core_types", "game_initialization_not_observed");
+    }
+    let core_total = records.iter().filter(|record| record.role == "core").count();
+    let core_observed = records.iter().filter(|record| record.role == "core" && record.target_address != 0).count();
+    if core_observed < core_total {
+        if !foundation_legacy_hook_errors().is_empty() {
+            return ("degraded", "legacy_core_hook_failure_observed");
+        }
+        return ("installing_core_hooks", "core_hook_address_not_observed");
+    }
+    ("installing_core_hooks", "core_hooks_not_registry_validated")
+}
+
+fn foundation_refresh_state(phase: &str) -> (u64, u64, u64, u64, u64) {
+    let now_wall = sniff_timestamp_ms();
+    let now_mono = foundation_monotonic_ns();
+    let mut state = match FOUNDATION_INIT_STATE.lock() {
+        Ok(value) => value,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match state.as_mut() {
+        Some(value) => {
+            value.attempts = value.attempts.saturating_add(1);
+            if value.phase != phase {
+                value.phase = phase.to_string();
+                value.generation = value.generation.saturating_add(1);
+                value.last_transition_wall_clock_ms = now_wall;
+                value.last_transition_monotonic_ns = now_mono;
+            }
+        }
+        None => {
+            *state = Some(FoundationInitStateData {
+                phase: phase.to_string(), generation: 1, attempts: 1,
+                first_observed_wall_clock_ms: now_wall,
+                last_transition_wall_clock_ms: now_wall,
+                last_transition_monotonic_ns: now_mono,
+            });
+        }
+    }
+    let value = state.as_ref().unwrap();
+    (value.generation, value.attempts, value.first_observed_wall_clock_ms,
+     value.last_transition_wall_clock_ms, value.last_transition_monotonic_ns)
+}
+
+unsafe fn foundation_init_status_endpoint() -> String {
+    let records = foundation_hook_records();
+    let (phase, blocker) = foundation_observed_phase(&records);
+    let (generation, attempts, first_wall, transition_wall, transition_mono) = foundation_refresh_state(phase);
+    let core_total = records.iter().filter(|record| record.role == "core").count();
+    let core_observed = records.iter().filter(|record| record.role == "core" && record.target_address != 0).count();
+    let optional_total = records.iter().filter(|record| record.role == "optional").count();
+    let optional_observed = records.iter().filter(|record| record.role == "optional" && record.target_address != 0).count();
+    let source_commit = option_env!("HLPATCH_SOURCE_COMMIT")
+        .map(|value| format!("\"{}\"", json_escape(value))).unwrap_or_else(|| "null".to_string());
+    format!(
+        r#"{{"ok":true,"foundation_mode":"passive_observation_only","phase":"{}","ready":false,"readiness_blocker":"{}","generation":{},"attempts":{},"first_observed_wall_clock_ms":{},"last_transition_wall_clock_ms":{},"last_transition_monotonic_ns":{},"hooks":{{"core_total":{},"core_legacy_address_observed":{},"core_registry_validated":0,"optional_total":{},"optional_legacy_address_observed":{}}},"capture_enabled":{},"fingerprints":{{"plugin_version":"{}","source_commit":{},"source_commit_error":{},"game_version":null,"game_version_error":"not_collected_in_foundation","resource_version":null,"resource_version_error":"not_collected_in_foundation","assembly_fingerprint":null,"assembly_fingerprint_error":"not_collected_in_foundation","mdb_sha256":null,"mdb_sha256_error":"not_collected_in_foundation","hook_registry_schema_version":1,"observation_schema_version":null}}}}"#,
+        phase, blocker, generation, attempts, first_wall, transition_wall, transition_mono,
+        core_total, core_observed, optional_total, optional_observed,
+        SNIFF_ENABLED.load(Ordering::Acquire), json_escape(PLUGIN_VERSION), source_commit,
+        if option_env!("HLPATCH_SOURCE_COMMIT").is_some() { "null" } else { "\"compile_time_source_commit_unavailable\"" }
+    )
+}
+
+unsafe fn foundation_hook_registry_endpoint() -> String {
+    let records = foundation_hook_records();
+    let items = records.iter().map(foundation_hook_record_json).collect::<Vec<_>>().join(",");
+    format!(
+        r#"{{"ok":true,"schema_version":1,"ownership_model":"legacy_snapshot_not_yet_managed","resolve_validate_commit_active":false,"count":{},"hooks":[{}]}}"#,
+        records.len(), items
+    )
+}
+
+fn foundation_hook_diagnostics_endpoint() -> String {
+    let errors = foundation_legacy_hook_errors();
+    let items = errors.iter().map(|(hook, error)| format!(
+        r#"{{"hook_id":"{}","stage":"legacy_install","raw_error":"{}"}}"#,
+        json_escape(hook), json_escape(error)
+    )).collect::<Vec<_>>().join(",");
+    format!(
+        r#"{{"ok":true,"schema_version":1,"diagnostic_source":"legacy_hook_status","failure_count":{},"failures":[{}]}}"#,
+        errors.len(), items
+    )
+}
+
+fn foundation_capture_status_endpoint() -> String {
+    format!(
+        r#"{{"ok":true,"hooks_installed":"reported_separately_by_registry","capture_enabled":{},"active_mode":"legacy_protocol_capture","capture_generation":null,"change_sequence":null,"control_status":"read_only_foundation"}}"#,
+        SNIFF_ENABLED.load(Ordering::Acquire)
+    )
+}
+
+// ===== Observation storage raw range export A1 =====
+fn storage_range_error(stream: &mut std::net::TcpStream, status: &str, error: &str) {
+    use std::io::Write;
+    let body = format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(error));
+    let response = format!(
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status, body.len(), body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn storage_read_range(stream: &mut std::net::TcpStream, uri: &str) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let pairs = match parse_query_pairs(uri) {
+        Ok(value) => value,
+        Err(error) => {
+            storage_range_error(stream, "400 Bad Request", &error);
+            return;
+        }
+    };
+    if pairs.iter().filter(|(key, _)| key == "file_id").count() != 1
+        || pairs.iter().filter(|(key, _)| key == "offset").count() != 1
+        || pairs.iter().filter(|(key, _)| key == "length").count() != 1
+    {
+        storage_range_error(stream, "400 Bad Request", "missing_or_duplicate_range_parameter");
+        return;
+    }
+    let file_id = match query_pair(&pairs, "file_id").parse::<i64>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            storage_range_error(stream, "400 Bad Request", "invalid_file_id");
+            return;
+        }
+    };
+    let offset = match query_pair(&pairs, "offset").parse::<u64>() {
+        Ok(value) => value,
+        _ => {
+            storage_range_error(stream, "400 Bad Request", "invalid_offset");
+            return;
+        }
+    };
+    let requested_length = match query_pair(&pairs, "length").parse::<u64>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            storage_range_error(stream, "400 Bad Request", "invalid_length");
+            return;
+        }
+    };
+    let connection = match open_observation_storage() {
+        Ok(value) => value,
+        Err(error) => {
+            storage_range_error(stream, "500 Internal Server Error", &error);
+            return;
+        }
+    };
+    let record = connection.query_row(
+        "SELECT session_id,relative_path,byte_length FROM observation_files WHERE file_id=?1",
+        rusqlite::params![file_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+    );
+    let (session_id, relative_path, indexed_length) = match record {
+        Ok(value) => value,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            storage_range_error(stream, "404 Not Found", "file_not_found");
+            return;
+        }
+        Err(error) => {
+            storage_range_error(stream, "500 Internal Server Error", &format!("query_file:{}", error));
+            return;
+        }
+    };
+    if indexed_length < 0 {
+        storage_range_error(stream, "500 Internal Server Error", "negative_indexed_length");
+        return;
+    }
+    let session_root = observation_storage_root().join("sessions").join(&session_id);
+    let target = session_root.join(&relative_path);
+    let canonical_root = match session_root.canonicalize() {
+        Ok(value) => value,
+        Err(error) => {
+            storage_range_error(stream, "500 Internal Server Error", &format!("canonical_session_root:{}", error));
+            return;
+        }
+    };
+    let canonical_target = match target.canonicalize() {
+        Ok(value) => value,
+        Err(error) => {
+            storage_range_error(stream, "404 Not Found", &format!("canonical_file:{}", error));
+            return;
+        }
+    };
+    if !canonical_target.starts_with(&canonical_root) {
+        storage_range_error(stream, "409 Conflict", "file_outside_session_root");
+        return;
+    }
+    let mut file = match std::fs::File::open(&canonical_target) {
+        Ok(value) => value,
+        Err(error) => {
+            storage_range_error(stream, "404 Not Found", &format!("open_file:{}", error));
+            return;
+        }
+    };
+    let actual_total = match file.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => {
+            storage_range_error(stream, "409 Conflict", "indexed_target_not_file");
+            return;
+        }
+        Err(error) => {
+            storage_range_error(stream, "500 Internal Server Error", &format!("file_metadata:{}", error));
+            return;
+        }
+    };
+    if actual_total != indexed_length as u64 {
+        storage_range_error(stream, "409 Conflict", "indexed_length_mismatch");
+        return;
+    }
+    if actual_total == 0 {
+        if offset != 0 {
+            storage_range_error(stream, "416 Range Not Satisfiable", "offset_out_of_range");
+            return;
+        }
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nX-HLPATCH-File-Id: {}\r\nX-HLPATCH-File-Length: 0\r\nX-HLPATCH-Range-Start: 0\r\nX-HLPATCH-Range-End-Exclusive: 0\r\nConnection: close\r\n\r\n",
+            file_id
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
+    if offset >= actual_total {
+        storage_range_error(stream, "416 Range Not Satisfiable", "offset_out_of_range");
+        return;
+    }
+    let actual_length = requested_length.min(actual_total - offset);
+    if let Err(error) = file.seek(SeekFrom::Start(offset)) {
+        storage_range_error(stream, "500 Internal Server Error", &format!("seek_file:{}", error));
+        return;
+    }
+    let header = format!(
+        "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {}-{}/{}\r\nX-HLPATCH-File-Id: {}\r\nX-HLPATCH-File-Length: {}\r\nX-HLPATCH-Range-Start: {}\r\nX-HLPATCH-Range-End-Exclusive: {}\r\nConnection: close\r\n\r\n",
+        actual_length, offset, offset + actual_length - 1, actual_total, file_id,
+        actual_total, offset, offset + actual_length
+    );
+    if stream.write_all(header.as_bytes()).is_err() {
+        return;
+    }
+    let mut remaining = actual_length;
+    let mut buffer = [0u8; 65536];
+    while remaining > 0 {
+        let want = remaining.min(buffer.len() as u64) as usize;
+        let count = match file.read(&mut buffer[..want]) {
+            Ok(0) => return,
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        if stream.write_all(&buffer[..count]).is_err() {
+            return;
+        }
+        remaining -= count as u64;
+    }
+    let _ = stream.flush();
+}
+
+// ===== Observation storage raw range export A1 =====
+// ===== Ordered turn and event JSON export C1 =====
+fn turn_event_msgpack_json(value: &rmpv::Value) -> String {
+    match value {
+        rmpv::Value::Nil => "null".to_string(),
+        rmpv::Value::Boolean(value) => value.to_string(),
+        rmpv::Value::Integer(value) => value.to_string(),
+        rmpv::Value::F32(value) => {
+            if value.is_finite() { value.to_string() } else { "null".to_string() }
+        }
+        rmpv::Value::F64(value) => {
+            if value.is_finite() { value.to_string() } else { "null".to_string() }
+        }
+        rmpv::Value::String(value) => format!("\"{}\"", json_escape(value.as_str().unwrap_or(""))),
+        rmpv::Value::Binary(value) => format!(
+            r#"{{"messagepack_type":"binary","body_hex":"{}"}}"#,
+            hex_encode(value),
+        ),
+        rmpv::Value::Array(values) => format!(
+            "[{}]",
+            values.iter().map(turn_event_msgpack_json).collect::<Vec<_>>().join(","),
+        ),
+        rmpv::Value::Map(values) => {
+            let fields = values.iter().map(|(key, value)| {
+                let key_text = match key {
+                    rmpv::Value::String(text) => text.as_str().unwrap_or("").to_string(),
+                    _ => turn_event_msgpack_json(key),
+                };
+                format!("\"{}\":{}", json_escape(&key_text), turn_event_msgpack_json(value))
+            }).collect::<Vec<_>>();
+            format!("{{{}}}", fields.join(","))
+        }
+        rmpv::Value::Ext(kind, value) => format!(
+            r#"{{"messagepack_type":"ext","ext_type":{},"body_hex":"{}"}}"#,
+            kind, hex_encode(value),
+        ),
+    }
+}
+
+fn turn_event_map_field<'a>(value: &'a rmpv::Value, name: &str) -> Option<&'a rmpv::Value> {
+    match value {
+        rmpv::Value::Map(fields) => fields.iter().find_map(|(key, value)| {
+            match key {
+                rmpv::Value::String(text) if text.as_str() == Some(name) => Some(value),
+                _ => None,
+            }
+        }),
+        _ => None,
+    }
+}
+
+fn turn_event_selected_data(value: &rmpv::Value) -> Option<String> {
+    let data = turn_event_map_field(value, "data")?;
+    let fields = match data {
+        rmpv::Value::Map(fields) => fields,
+        _ => return None,
+    };
+    let has_chara = fields.iter().any(|(key, _)| {
+        matches!(key, rmpv::Value::String(text) if text.as_str() == Some("chara_info"))
+    });
+    let has_data_set = fields.iter().any(|(key, _)| {
+        matches!(key, rmpv::Value::String(text) if text.as_str().map(|value| value.ends_with("_data_set")).unwrap_or(false))
+    });
+    if !has_chara || !has_data_set {
+        return None;
+    }
+    let selected = fields.iter().filter_map(|(key, value)| {
+        let name = match key {
+            rmpv::Value::String(text) => text.as_str()?,
+            _ => return None,
+        };
+        if name == "chara_info" || name == "unchecked_event_array" || name.ends_with("_data_set") {
+            Some(format!("\"{}\":{}", json_escape(name), turn_event_msgpack_json(value)))
+        } else {
+            None
+        }
+    }).collect::<Vec<_>>();
+    Some(format!("{{{}}}", selected.join(",")))
+}
+
+fn storage_turn_event_jsons(uri: &str) -> String {
+    let pairs = match parse_query_pairs(uri) {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)),
+    };
+    let session_id = query_pair(&pairs, "session_id");
+    if session_id.is_empty() {
+        return r#"{"ok":false,"error":"missing_session_id"}"#.to_string();
+    }
+    let after_sequence = if query_pair(&pairs, "after_sequence").is_empty() {
+        0i64
+    } else {
+        match query_pair(&pairs, "after_sequence").parse::<i64>() {
+            Ok(value) if value >= 0 => value,
+            _ => return r#"{"ok":false,"error":"invalid_after_sequence"}"#.to_string(),
+        }
+    };
+    let limit = if query_pair(&pairs, "limit").is_empty() {
+        100usize
+    } else {
+        match query_pair(&pairs, "limit").parse::<usize>() {
+            Ok(value) if value >= 1 && value <= 500 => value,
+            _ => return r#"{"ok":false,"error":"invalid_limit"}"#.to_string(),
+        }
+    };
+    let connection = match open_observation_storage() {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)),
+    };
+    let exists = connection.query_row(
+        "SELECT 1 FROM observation_sessions WHERE session_id=?1",
+        rusqlite::params![session_id],
+        |_| Ok(()),
+    );
+    if matches!(exists, Err(rusqlite::Error::QueryReturnedNoRows)) {
+        return r#"{"ok":false,"error":"session_not_found"}"#.to_string();
+    }
+    if let Err(error) = exists {
+        return format!(r#"{{"ok":false,"error":"query_session:{}"}}"#, json_escape(&error.to_string()));
+    }
+    let mut statement = match connection.prepare(
+        "SELECT file_id,relative_path,created_at_ms FROM observation_files \
+         WHERE session_id=?1 AND relative_path LIKE 'protocol/response/%/payload.bin' \
+         ORDER BY created_at_ms ASC,file_id ASC"
+    ) {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"prepare_responses:{}"}}"#, json_escape(&error.to_string())),
+    };
+    let rows = match statement.query_map(rusqlite::params![session_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+    }) {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"query_responses:{}"}}"#, json_escape(&error.to_string())),
+    };
+    let session_root = observation_storage_root().join("sessions").join(&session_id);
+    let mut matched_sequence = 0i64;
+    let mut emitted = Vec::new();
+    let mut scanned_responses = 0usize;
+    let mut decode_failures = Vec::new();
+    for row in rows {
+        let (file_id, relative_path, response_timestamp_ms) = match row {
+            Ok(value) => value,
+            Err(error) => {
+                decode_failures.push(format!(r#"{{"file_id":null,"error":"row:{}"}}"#, json_escape(&error.to_string())));
+                continue;
+            }
+        };
+        scanned_responses += 1;
+        let bytes = match std::fs::read(session_root.join(&relative_path)) {
+            Ok(value) => value,
+            Err(error) => {
+                decode_failures.push(format!(r#"{{"file_id":{},"error":"read:{}"}}"#, file_id, json_escape(&error.to_string())));
+                continue;
+            }
+        };
+        let mut cursor = std::io::Cursor::new(&bytes);
+        let decoded = match rmpv::decode::read_value(&mut cursor) {
+            Ok(value) => value,
+            Err(error) => {
+                decode_failures.push(format!(r#"{{"file_id":{},"error":"decode:{}"}}"#, file_id, json_escape(&error.to_string())));
+                continue;
+            }
+        };
+        if cursor.position() != bytes.len() as u64 {
+            decode_failures.push(format!(r#"{{"file_id":{},"error":"trailing_bytes","decoded_bytes":{},"total_bytes":{}}}"#, file_id, cursor.position(), bytes.len()));
+            continue;
+        }
+        let selected_data = match turn_event_selected_data(&decoded) {
+            Some(value) => value,
+            None => continue,
+        };
+        matched_sequence += 1;
+        if matched_sequence <= after_sequence {
+            continue;
+        }
+        if emitted.len() >= limit {
+            break;
+        }
+        let request_id = relative_path.strip_prefix("protocol/response/")
+            .and_then(|value| value.split('-').next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let url_path = format!("protocol/response/{}/url.txt", relative_path
+            .strip_prefix("protocol/response/").and_then(|value| value.split('/').next()).unwrap_or(""));
+        let source_url = std::fs::read_to_string(session_root.join(&url_path)).unwrap_or_default();
+        emitted.push(format!(
+            r#"{{"sequence":{},"request_id":{},"response_timestamp_ms":{},"source_file_id":{},"source_relative_path":"{}","source_url":"{}","data":{}}}"#,
+            matched_sequence, request_id, response_timestamp_ms, file_id,
+            json_escape(&relative_path), json_escape(&source_url), selected_data,
+        ));
+    }
+    let has_more = emitted.len() == limit;
+    let next_sequence = emitted.last().and_then(|item| {
+        let prefix = "{\"sequence\":";
+        item.strip_prefix(prefix).and_then(|rest| rest.split(',').next()).and_then(|value| value.parse::<i64>().ok())
+    }).unwrap_or(after_sequence);
+    format!(
+        r#"{{"ok":true,"session_id":"{}","ordering":"response_received_at_then_file_id","after_sequence":{},"next_sequence":{},"count":{},"has_more":{},"scanned_responses":{},"decode_failure_count":{},"decode_failures":[{}],"records":[{}]}}"#,
+        json_escape(&session_id), after_sequence, next_sequence, emitted.len(), has_more,
+        scanned_responses, decode_failures.len(), decode_failures.join(","), emitted.join(","),
+    )
+}
+
+// ===== Ordered turn and event JSON export C1 =====
+// ===== Exact single-method IL2CPP probe B1 =====
+unsafe fn exact_method_probe(uri: &str) -> String {
+    let pairs = match parse_query_pairs(uri) {
+        Ok(value) => value,
+        Err(error) => return format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&error)),
+    };
+    let declaring_type = query_pair(&pairs, "declaring_type");
+    let method_name = query_pair(&pairs, "method");
+    if declaring_type.is_empty() || method_name.is_empty() {
+        return r#"{"ok":false,"error":"missing_declaring_type_or_method"}"#.to_string();
+    }
+    let requested_parameter_count = if query_pair(&pairs, "parameter_count").is_empty() {
+        None
+    } else {
+        match query_pair(&pairs, "parameter_count").parse::<u32>() {
+            Ok(value) if value <= 64 => Some(value),
+            _ => return r#"{"ok":false,"error":"invalid_parameter_count"}"#.to_string(),
+        }
+    };
+    let requested_bytes = if query_pair(&pairs, "max_bytes").is_empty() {
+        256usize
+    } else {
+        match query_pair(&pairs, "max_bytes").parse::<usize>() {
+            Ok(value) if value >= 4 && value <= 512 => value,
+            _ => return r#"{"ok":false,"error":"invalid_max_bytes"}"#.to_string(),
+        }
+    };
+    let image = get_image();
+    if image.is_null() {
+        return r#"{"ok":false,"error":"image_null"}"#.to_string();
+    }
+    let class = find_class_by_short_name(image, &declaring_type);
+    if class.is_null() {
+        return r#"{"ok":false,"error":"declaring_type_not_found"}"#.to_string();
+    }
+    let get_methods_ptr = resolve_il2cpp_symbol("il2cpp_class_get_methods");
+    let get_name_ptr = resolve_il2cpp_symbol("il2cpp_method_get_name");
+    let get_param_count_ptr = resolve_il2cpp_symbol("il2cpp_method_get_param_count");
+    let get_param_ptr = resolve_il2cpp_symbol("il2cpp_method_get_param");
+    let get_return_ptr = resolve_il2cpp_symbol("il2cpp_method_get_return_type");
+    let get_type_name_ptr = resolve_il2cpp_symbol("il2cpp_type_get_name");
+    if get_methods_ptr.is_null() || get_name_ptr.is_null() || get_param_count_ptr.is_null()
+        || get_param_ptr.is_null() || get_return_ptr.is_null() || get_type_name_ptr.is_null()
+    {
+        return r#"{"ok":false,"error":"required_il2cpp_symbol_missing"}"#.to_string();
+    }
+    let get_methods: FnClassGetMethods = std::mem::transmute(get_methods_ptr);
+    let get_name: FnMethodGetName = std::mem::transmute(get_name_ptr);
+    let get_param_count: unsafe extern "C" fn(*const c_void) -> u32 = std::mem::transmute(get_param_count_ptr);
+    let get_param: unsafe extern "C" fn(*const c_void, u32) -> *const c_void = std::mem::transmute(get_param_ptr);
+    let get_return: unsafe extern "C" fn(*const c_void) -> *const c_void = std::mem::transmute(get_return_ptr);
+    let get_type_name: unsafe extern "C" fn(*const c_void) -> *const c_char = std::mem::transmute(get_type_name_ptr);
+
+    let mut iterator = ptr::null_mut();
+    let mut matches: Vec<*const c_void> = Vec::new();
+    loop {
+        let method_info = get_methods(class, &mut iterator);
+        if method_info.is_null() {
+            break;
+        }
+        if il2cpp_c_string(get_name(method_info)) != method_name {
+            continue;
+        }
+        if let Some(expected) = requested_parameter_count {
+            if get_param_count(method_info) != expected {
+                continue;
+            }
+        }
+        matches.push(method_info);
+    }
+    if matches.is_empty() {
+        return r#"{"ok":false,"error":"method_not_found"}"#.to_string();
+    }
+    if matches.len() != 1 {
+        let counts = matches.iter().map(|method_info| get_param_count(*method_info).to_string())
+            .collect::<Vec<_>>().join(",");
+        return format!(r#"{{"ok":false,"error":"ambiguous_method","match_count":{},"parameter_counts":[{}]}}"#, matches.len(), counts);
+    }
+
+    let method_info = matches[0];
+    let method_pointer = if is_readable_range(method_info as usize, std::mem::size_of::<usize>()) {
+        std::ptr::read_unaligned::<usize>(method_info as *const usize)
+    } else {
+        0
+    };
+    if method_pointer == 0 {
+        return r#"{"ok":false,"error":"method_pointer_null"}"#.to_string();
+    }
+    let readable_bytes = (requested_bytes / 4) * 4;
+    if readable_bytes == 0 || !is_readable_range(method_pointer, readable_bytes) {
+        return r#"{"ok":false,"error":"method_bytes_not_readable"}"#.to_string();
+    }
+    let bytes = std::slice::from_raw_parts(method_pointer as *const u8, readable_bytes);
+    let mut direct_calls = Vec::new();
+    for offset in (0..readable_bytes).step_by(4) {
+        let instruction = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        if instruction & 0xfc00_0000 == 0x9400_0000 {
+            let immediate = ((instruction & 0x03ff_ffff) as i32) << 6 >> 4;
+            let target = (method_pointer as i64 + offset as i64 + immediate as i64) as usize;
+            direct_calls.push(format!(r#"{{"offset":{},"target":"0x{:x}"}}"#, offset, target));
+        }
+    }
+    let parameter_count = get_param_count(method_info);
+    let mut parameter_types = Vec::with_capacity(parameter_count as usize);
+    for index in 0..parameter_count {
+        let parameter = get_param(method_info, index);
+        parameter_types.push(if parameter.is_null() {
+            "unresolved".to_string()
+        } else {
+            il2cpp_c_string(get_type_name(parameter))
+        });
+    }
+    let return_pointer = get_return(method_info);
+    let return_type = if return_pointer.is_null() {
+        "unresolved".to_string()
+    } else {
+        il2cpp_c_string(get_type_name(return_pointer))
+    };
+    let parameters_json = parameter_types.iter()
+        .map(|value| format!(r#""{}""#, json_escape(value)))
+        .collect::<Vec<_>>().join(",");
+    format!(
+        r#"{{"ok":true,"scope":"exact_declaring_type_method","declaring_type":"{}","method":"{}","parameter_count":{},"parameter_types":[{}],"return_type":"{}","method_info":"0x{:x}","method_pointer":"0x{:x}","bounded_bytes_length":{},"bounded_bytes_complete":false,"bounded_bytes_hex":"{}","direct_bl_targets":[{}]}}"#,
+        json_escape(&declaring_type), json_escape(&method_name), parameter_count, parameters_json,
+        json_escape(&return_type), method_info as usize, method_pointer, readable_bytes,
+        hex_encode(bytes), direct_calls.join(",")
+    )
+}
+
+// ===== Exact single-method IL2CPP probe B1 =====
 /// 辅助函数：IL2CPP类型枚举转可读名称
 fn type_enum_to_name(te: u8) -> String {
     match te {
